@@ -118,7 +118,8 @@ export const whatsappConnections = pgTable("whatsapp_connections", {
   id: id(),
   businessId: businessId().unique(),
   status: text("status").$type<ConnectionStatus>().notNull().default("disconnected"),
-  connectedVia: text("connected_via").$type<"embedded_signup" | "manual">(),
+  /** embedded_signup / manual = official Cloud API; qr = linked device via WhatsApp Web (unofficial). */
+  connectedVia: text("connected_via").$type<"embedded_signup" | "manual" | "qr">(),
   wabaId: text("waba_id"),
   wabaName: text("waba_name"),
   metaBusinessId: text("meta_business_id"),
@@ -190,6 +191,8 @@ export const customers = pgTable(
     id: id(),
     businessId: businessId(),
     waId: text("wa_id").notNull(),
+    /** Chat id for linked-device (QR) connections, e.g. "9477…@c.us" or "…@lid". */
+    waChatId: text("wa_chat_id"),
     phone: text("phone").notNull(),
     profileName: text("profile_name").notNull().default(""),
     displayName: text("display_name").notNull().default(""),
@@ -611,7 +614,8 @@ export type NotificationType =
   | "human_support"
   | "message_failed"
   | "low_stock"
-  | "order_status";
+  | "order_status"
+  | "whatsapp_status";
 
 export const notifications = pgTable(
   "notifications",

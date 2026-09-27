@@ -23,7 +23,7 @@ export function isWindowOpen(lastInboundAt: Date | null | undefined, now = Date.
 
 export async function upsertCustomer(
   businessId: string,
-  input: { waId: string; profileName?: string; isTest?: boolean },
+  input: { waId: string; waChatId?: string; profileName?: string; isTest?: boolean },
 ): Promise<{ customer: typeof customers.$inferSelect; created: boolean }> {
   const db = await getDb();
   const now = new Date();
@@ -38,6 +38,7 @@ export async function upsertCustomer(
         lastInteractionAt: now,
         profileName: input.profileName || existing.profileName,
         displayName: existing.displayName || input.profileName || "",
+        ...(input.waChatId && input.waChatId !== existing.waChatId ? { waChatId: input.waChatId } : {}),
       })
       .where(eq(customers.id, existing.id))
       .returning();
@@ -48,7 +49,9 @@ export async function upsertCustomer(
     .values({
       businessId,
       waId: input.waId,
-      phone: input.waId.startsWith("test-") ? "" : `+${input.waId}`,
+      waChatId: input.waChatId ?? null,
+      // Only real numbers become a phone; test chats and hidden (@lid) contacts have none.
+      phone: /^\d+$/.test(input.waId) ? `+${input.waId}` : "",
       profileName: input.profileName ?? "",
       displayName: input.profileName ?? "",
       isTest: Boolean(input.isTest),

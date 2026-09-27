@@ -3,7 +3,9 @@ import { getDb } from "@/db";
 import { messages } from "@/db/schema";
 import { requireApiAuth } from "@/server/auth";
 import { errorResponse, notFound } from "@/server/http";
+import { connectionMode } from "@/server/whatsapp/channel";
 import { getCredentials } from "@/server/whatsapp/connection";
+import { webDownloadMedia } from "@/server/whatsapp/web";
 import { GraphError } from "@/server/whatsapp/graph";
 import { fetchIncomingMedia } from "@/server/whatsapp/messaging";
 
@@ -22,6 +24,18 @@ export async function GET(request: Request, ctx: RouteContext<"/api/media/[messa
       .where(and(eq(messages.id, messageId), eq(messages.businessId, auth.business.id)));
     const mediaId = message?.payload.media?.id;
     if (!message || message.direction !== "inbound" || !mediaId) throw notFound("Media not found");
+    if ((await connectionMode(auth.business.id)) === "web") {
+      const media = message.waMessageId ? await webDownloadMedia(auth.business.id, message.waMessageId) : null;
+      if (!media) throw notFound("Media is not available right now");
+      return new Response(new Uint8Array(media.data), {
+        headers: {
+          "Content-Type": media.mimeType,
+          "Cache-Control": "private, max-age=3600",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Disposition": `inline; filename="${(media.filename ?? "media").replace(/[^\w.-]/g, "_")}"`,
+        },
+      });
+    }
     const credentials = await getCredentials(auth.business.id);
     if (!credentials) throw notFound("WhatsApp is not connected");
     const media = await fetchIncomingMedia(credentials.accessToken, mediaId);

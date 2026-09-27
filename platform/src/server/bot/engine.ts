@@ -1,7 +1,7 @@
 import "server-only";
 import { getDb } from "@/db";
-import { conversations } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { conversations, messages } from "@/db/schema";
+import { and, desc, eq } from "drizzle-orm";
 import {
   getOrCreateConversation,
   loadConversation,
@@ -16,7 +16,7 @@ import { OrderError } from "../commerce/orders";
 import { log } from "../logger";
 import { notify } from "../notifications";
 import { deliver } from "../outbound";
-import { getMessagingService } from "../whatsapp/connection";
+import { getChannel } from "../whatsapp/channel";
 import type { OutboundMessage } from "../whatsapp/messaging";
 import { runAgent } from "./agent";
 import { loadBotContext } from "./settings";
@@ -40,6 +40,8 @@ function serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
 export type IncomingInput = {
   businessId: string;
   waId: string;
+  /** Linked-device chat id to reply to ("…@c.us" / "…@lid"). */
+  waChatId?: string;
   profileName?: string;
   message: InboundInput;
   isTest?: boolean;
@@ -53,13 +55,15 @@ export async function handleIncoming(input: IncomingInput) {
   const { businessId } = input;
   const { customer, created: newCustomer } = await upsertCustomer(businessId, {
     waId: input.waId,
+    waChatId: input.waChatId,
     profileName: input.profileName,
     isTest: input.isTest,
   });
   const { conversation, created: newConversation } = await getOrCreateConversation(businessId, customer.id, Boolean(input.isTest));
   const hadUnread = conversation.unreadCount > 0;
 
-  const saved = await saveInboundMessage(businessId, conversation.id, await enrichReply(businessId, input.message));
+  const choice = await resolveTextChoice(businessId, conversation.id, input.message);
+  const saved = await saveInboundMessage(businessId, conversation.id, await enrichReply(businessId, choice));
   if (!saved) return { conversationId: conversation.id, duplicate: true as const };
 
   if (newCustomer && !input.isTest) {
@@ -72,9 +76,9 @@ export async function handleIncoming(input: IncomingInput) {
   }
 
   // Blue ticks: best effort.
-  if (!input.isTest && input.message.waMessageId) {
-    const service = await getMessagingService(businessId);
-    service?.markRead(input.message.waMessageId).catch(() => undefined);
+  if (!input.isTest) {
+    const channel = await getChannel(businessId, conversation);
+    channel?.markRead(customer, input.message.waMessageId ?? null).catch(() => undefined);
   }
 
   await serialize(conversation.id, () =>
@@ -214,4 +218,34 @@ async function enrichReply(businessId: string, message: InboundInput): Promise<I
   if (!found) return message;
   const verb = replyId!.startsWith("order_") ? "I want to order" : "Show me";
   return { ...message, content: `${verb}: ${found.product.name} (productId ${found.product.id})` };
+}
+
+/**
+ * Where buttons can't be shown (linked devices, or the Cloud API's text fallback),
+ * options are sent as a numbered list. A reply of "1" or the option's title is
+ * treated exactly like tapping that button.
+ */
+async function resolveTextChoice(businessId: string, conversationId: string, message: InboundInput): Promise<InboundInput> {
+  if (message.type !== "text" || message.payload?.interactive) return message;
+  const text = message.content.trim().replace(/[.)!]+$/, "").toLowerCase();
+  if (!text || text.length > 40) return message;
+  const db = await getDb();
+  const [last] = await db
+    .select({ payload: messages.payload })
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), eq(messages.businessId, businessId), eq(messages.direction, "outbound")))
+    .orderBy(desc(messages.createdAt))
+    .limit(1);
+  const interactive = last?.payload.interactive;
+  const options =
+    interactive?.kind === "buttons"
+      ? (interactive.buttons ?? [])
+      : interactive?.kind === "list"
+        ? (interactive.sections ?? []).flatMap((section) => section.rows)
+        : [];
+  if (!options.length) return message;
+  const index = /^\d{1,2}$/.test(text) ? Number(text) - 1 : -1;
+  const option = options[index] ?? options.find((o) => o.title.toLowerCase() === text);
+  if (!option) return message;
+  return { ...message, type: "interactive", content: option.title, payload: { ...message.payload, interactive: { kind: "reply", replyId: option.id } } };
 }

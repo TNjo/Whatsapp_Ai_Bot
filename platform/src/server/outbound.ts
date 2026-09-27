@@ -6,9 +6,10 @@ import { insertOutboundRecord, isWindowOpen, loadConversation } from "./conversa
 import { publish } from "./events";
 import { log } from "./logger";
 import { notify } from "./notifications";
-import { getMessagingService } from "./whatsapp/connection";
+import { getChannel } from "./whatsapp/channel";
 import { GraphError } from "./whatsapp/graph";
 import { toPlainText, type OutboundMessage } from "./whatsapp/messaging";
+import { WebLinkError } from "./whatsapp/web";
 
 export type DeliveryResult =
   | { ok: true; messageId: string; simulated: boolean }
@@ -73,30 +74,31 @@ export async function deliver(input: {
     publish(businessId, { type: "conversation.updated", conversationId });
   };
 
-  if (conversation.isTest) {
+  const channel = await getChannel(businessId, conversation);
+  if (channel?.kind === "test") {
     await finish("sent");
     return { ok: true, messageId: record.id, simulated: true };
   }
 
-  if (message.kind !== "template" && !isWindowOpen(conversation.lastInboundAt)) {
+  if (channel?.needsWindow && message.kind !== "template" && !isWindowOpen(conversation.lastInboundAt)) {
     const error = "More than 24 hours have passed since the customer's last message. Only approved templates can be sent.";
     await finish("failed", { errorMessage: error });
     return { ok: false, messageId: record.id, reason: "window_closed", error };
   }
 
-  const service = await getMessagingService(businessId);
-  if (!service) {
+  if (!channel) {
     const error = "WhatsApp is not connected.";
     await finish("failed", { errorMessage: error });
     return { ok: false, messageId: record.id, reason: "not_connected", error };
   }
 
   try {
-    const result = await service.send(customer.waId, message);
-    await finish("sent", { waMessageId: result.waMessageId });
+    const result = await channel.send(customer, message);
+    await finish("sent", { waMessageId: result.waMessageId ?? undefined });
     log.info("whatsapp.send", {
       businessId,
       conversationId,
+      channel: channel.kind,
       kind: message.kind,
       sender: input.sender,
       fellBackToText: result.fellBackToText,
@@ -104,7 +106,8 @@ export async function deliver(input: {
     });
     return { ok: true, messageId: record.id, simulated: false };
   } catch (err) {
-    const error = err instanceof GraphError ? err.friendly : "Unable to send the message. Please try again.";
+    const error =
+      err instanceof GraphError ? err.friendly : err instanceof WebLinkError ? err.message : "Unable to send the message. Please try again.";
     await finish("failed", { errorMessage: error });
     log.error("whatsapp.send.failed", { businessId, conversationId, kind: message.kind, code: err instanceof GraphError ? err.code : undefined, err });
     await notify(businessId, {

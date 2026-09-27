@@ -18,7 +18,7 @@ import {
 import { formatMoney } from "@/lib/format";
 import { REVENUE_STATUSES, STATUS_LABEL, STATUS_TRANSITIONS, STOCK_RELEASING, type OrderStatus } from "@/lib/order-status";
 import { audit, type AuditActor } from "../audit";
-import { isWindowOpen } from "../conversations";
+import { canSendFreeform } from "../whatsapp/channel";
 import { publish } from "../events";
 import { ApiError, notFound } from "../http";
 import { log } from "../logger";
@@ -237,7 +237,7 @@ async function notifyCustomer(order: Order, status: OrderStatus): Promise<Notify
   };
   const body = renderMessage(settings?.statusMessages?.[key] || DEFAULT_STATUS_MESSAGES[key], vars);
 
-  if (conversation.isTest || isWindowOpen(conversation.lastInboundAt)) {
+  if (await canSendFreeform(order.businessId, conversation)) {
     const result = await deliver({
       businessId: order.businessId,
       conversationId: conversation.id,

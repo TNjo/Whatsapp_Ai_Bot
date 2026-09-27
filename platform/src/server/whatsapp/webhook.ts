@@ -1,15 +1,14 @@
 import "server-only";
 import crypto from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
-import { messages, whatsappConnections, type MessagePayload, type MessageStatus, type MessageType } from "@/db/schema";
+import { whatsappConnections, type MessagePayload, type MessageType } from "@/db/schema";
 import { handleIncoming } from "../bot/engine";
 import { env } from "../env";
-import { publish } from "../events";
 import { log } from "../logger";
-import { notify } from "../notifications";
 import { businessForPhoneNumberId } from "./connection";
 import { describeGraphError, type GraphErrorBody } from "./graph";
+import { applyMessageStatus } from "./message-status";
 
 /** Validates X-Hub-Signature-256 (HMAC-SHA256 of the raw body with the app secret). */
 export function verifySignature(rawBody: string, header: string | null, secret = env.meta.appSecret): boolean {
@@ -116,38 +115,11 @@ export function normalizeMessage(msg: WaMessage): { type: MessageType; content: 
   }
 }
 
-const STATUS_RANK: Record<string, number> = { pending: 0, sent: 1, delivered: 2, read: 3 };
-
 async function applyStatus(businessId: string, status: WaStatus) {
-  const db = await getDb();
-  const [row] = await db
-    .select()
-    .from(messages)
-    .where(and(eq(messages.waMessageId, status.id), eq(messages.businessId, businessId)));
-  if (!row) return;
-  let next: MessageStatus | null = null;
-  let errorMessage: string | null = row.errorMessage;
   if (status.status === "failed") {
-    next = "failed";
-    const error = describeGraphError(status.errors?.[0], 400);
-    errorMessage = error.friendly;
-  } else if (status.status in STATUS_RANK && STATUS_RANK[status.status] > (STATUS_RANK[row.status] ?? -1) && row.status !== "failed") {
-    next = status.status as MessageStatus;
-  }
-  if (!next) return;
-  await db
-    .update(messages)
-    .set({ status: next, errorMessage, statusUpdatedAt: new Date() })
-    .where(eq(messages.id, row.id));
-  publish(businessId, { type: "message.status", conversationId: row.conversationId, messageId: row.id, status: next });
-  if (next === "failed") {
-    log.warn("whatsapp.delivery_failed", { businessId, messageId: row.id, code: status.errors?.[0]?.code });
-    await notify(businessId, {
-      type: "message_failed",
-      title: "A WhatsApp message could not be delivered",
-      body: errorMessage ?? "",
-      link: `/dashboard/conversations?c=${row.conversationId}`,
-    });
+    await applyMessageStatus(businessId, status.id, "failed", describeGraphError(status.errors?.[0], 400).friendly);
+  } else if (status.status === "sent" || status.status === "delivered" || status.status === "read") {
+    await applyMessageStatus(businessId, status.id, status.status);
   }
 }
 

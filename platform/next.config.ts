@@ -4,8 +4,8 @@ const nextConfig: NextConfig = {
   // This app lives in a subfolder of the repo; don't let a parent lockfile become the root.
   turbopack: { root: process.cwd() },
   outputFileTracingRoot: process.cwd(),
-  // Embedded Postgres (WASM) must be loaded by Node, not bundled.
-  serverExternalPackages: ["@electric-sql/pglite"],
+  // Embedded Postgres (WASM) and WhatsApp Web (headless Chrome) must be loaded by Node, not bundled.
+  serverExternalPackages: ["@electric-sql/pglite", "whatsapp-web.js", "puppeteer", "puppeteer-core", "qrcode"],
   poweredByHeader: false,
   async headers() {
     return [

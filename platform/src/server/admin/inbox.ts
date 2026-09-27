@@ -6,6 +6,7 @@ import { getOpenCart, viewCart } from "../commerce/cart";
 import { isWindowOpen, loadConversation, markConversationRead, setConversationAI, WINDOW_MS } from "../conversations";
 import { ApiError } from "../http";
 import { deliver } from "../outbound";
+import { canSendFreeform } from "../whatsapp/channel";
 import type { AuthContext } from "../auth";
 import { audit } from "../audit";
 
@@ -103,7 +104,7 @@ export async function conversationDetail(businessId: string, conversationId: str
           missing: cartView.missingFields.map((f) => f.label),
         }
       : null,
-    windowOpen: conversation.isTest || isWindowOpen(conversation.lastInboundAt),
+    windowOpen: await canSendFreeform(businessId, conversation),
     windowClosesAt: conversation.lastInboundAt ? new Date(conversation.lastInboundAt.getTime() + WINDOW_MS) : null,
     templates,
   };

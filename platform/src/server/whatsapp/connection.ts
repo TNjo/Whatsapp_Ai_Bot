@@ -56,12 +56,16 @@ export async function connectionView(businessId: string) {
     appSecretSet: Boolean(env.meta.appSecret),
     serverCredentialsAvailable: Boolean(env.whatsapp.accessToken && env.whatsapp.phoneNumberId && env.whatsapp.businessAccountId),
   };
+  const { linkState } = await import("./web");
+  const link = linkState(businessId);
   if (!found) {
-    return { status: "disconnected" as const, setup, connection: null };
+    return { status: "disconnected" as const, mode: null, link, setup, connection: null };
   }
   const { connection, phone } = found;
   return {
     status: connection.status,
+    mode: connection.connectedVia === "qr" ? ("qr" as const) : connection.connectedVia ? ("cloud" as const) : null,
+    link,
     setup,
     connection: {
       connectedVia: connection.connectedVia,
@@ -84,7 +88,7 @@ export async function connectionView(businessId: string) {
 /** Decrypted credentials for sending. Only ever used server-side. */
 export async function getCredentials(businessId: string): Promise<(Credentials & { wabaId: string | null }) | null> {
   const found = await getConnection(businessId);
-  if (!found || found.connection.status !== "connected" || !found.phone) return null;
+  if (!found || found.connection.status !== "connected" || found.connection.connectedVia === "qr" || !found.phone) return null;
   const accessToken = decryptSecret(found.connection.accessTokenEnc);
   if (!accessToken) return null;
   return { accessToken, phoneNumberId: found.phone.phoneNumberId, wabaId: found.connection.wabaId };
@@ -138,6 +142,10 @@ async function setStatus(businessId: string, values: Partial<typeof whatsappConn
  */
 async function finishConnection(businessId: string, input: ConnectInput, actor: AuditActor) {
   const db = await getDb();
+  const current = await getConnection(businessId);
+  if (current?.connection.connectedVia === "qr" && current.connection.status !== "disconnected") {
+    throw new ApiError(409, "Unlink the linked WhatsApp (QR) before connecting the WhatsApp Business API.");
+  }
   await setStatus(businessId, { status: "connecting", lastError: null });
 
   // The number may belong to another business on this platform — refuse rather than hijack it.
@@ -276,6 +284,10 @@ export async function connectManually(
 export async function disconnect(businessId: string, actor: AuditActor) {
   const found = await getConnection(businessId);
   if (!found) return connectionView(businessId);
+  if (found.connection.connectedVia === "qr") {
+    const { unlinkWeb } = await import("./web");
+    await unlinkWeb(businessId);
+  }
   const token = decryptSecret(found.connection.accessTokenEnc);
   if (token && found.connection.wabaId) {
     await graph(`${found.connection.wabaId}/subscribed_apps`, { token, method: "DELETE" }).catch((err) =>
@@ -289,6 +301,7 @@ export async function disconnect(businessId: string, actor: AuditActor) {
       .update(whatsappConnections)
       .set({
         status: "disconnected",
+        connectedVia: null,
         accessTokenEnc: null,
         registrationPinEnc: null,
         tokenExpiresAt: null,
@@ -309,6 +322,12 @@ export async function runHealthCheck(businessId: string): Promise<HealthCheck[]>
   const db = await getDb();
   const found = await getConnection(businessId);
   if (!found) return [];
+  if (found.connection.connectedVia === "qr") {
+    const { webHealthCheck } = await import("./web");
+    const checks = await webHealthCheck(businessId);
+    publish(businessId, { type: "whatsapp.updated" });
+    return checks;
+  }
   const { connection, phone } = found;
   const token = decryptSecret(connection.accessTokenEnc);
   const checks: HealthCheck[] = [];
@@ -449,7 +468,7 @@ const PURPOSE_GUESS: [RegExp, TemplatePurpose][] = [
 /** Pulls message templates and their approval status from Meta. */
 export async function syncTemplates(businessId: string) {
   const credentials = await getCredentials(businessId);
-  if (!credentials?.wabaId) throw new ApiError(400, "Connect WhatsApp before syncing templates.");
+  if (!credentials?.wabaId) throw new ApiError(400, "Templates come from the WhatsApp Business API. Connect it before syncing templates.");
   const data = await graph<{
     data?: { id: string; name: string; language: string; status: string; category: string; components?: { type: string; text?: string }[] }[];
   }>(`${credentials.wabaId}/message_templates`, {
