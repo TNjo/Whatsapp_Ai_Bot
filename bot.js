@@ -121,7 +121,7 @@ client.on('message', async msg => {
             const response = await axios.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 {
-                    model: "llama-3.1-8b-instant",
+                    model: "openai/gpt-oss-20b",
                     messages: [
                         { role: "system", content: "You are a helpful AI assistant. Answer the user's question clearly and concisely." },
                         { role: "user", content: question }
@@ -165,7 +165,7 @@ client.on('message', async msg => {
         const response = await axios.post(
             "https://api.groq.com/openai/v1/chat/completions",
             {
-                model: "llama-3.1-8b-instant",
+                model: "openai/gpt-oss-20b",
                 messages: [
                     { role: "system", content: "You are Tharuka's personal AI assistant, powered by Llama-3. Tharuka is currently not available or busy right now. Be friendly and helpful. If someone has a message for Tharuka, acknowledge it and let them know you'll pass it along. If they have questions you can help with, assist them. Always mention that he will get back to them when available. Use 'he/him' pronouns when referring to Tharuka. At the end of your first reply, mention that they can type --help to see available options." },
                     { role: "user", content: msg.body }

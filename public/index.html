@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Booth</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect rx='8' width='32' height='32' fill='%2317352a'/%3E%3Cpath d='M8 11h16v8H13l-5 4v-4H8z' fill='%23d6f26a'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="boot" class="boot">Opening the desk…</div>
+  <section id="view-auth" class="auth" hidden>
+    <form id="auth-form" class="auth-card panel stack">
+      <p class="kicker">Booth</p>
+      <h1 id="auth-title">Sign in</h1>
+      <p class="lede" id="auth-lede">Sign in to see only your bots and chats.</p>
+      <label class="field">
+        <span>Username</span>
+        <input id="auth-user" name="username" autocomplete="username" required minlength="3" maxlength="32">
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input id="auth-pass" name="password" type="password" autocomplete="current-password" required minlength="8">
+      </label>
+      <p id="auth-error" class="notice" data-kind="bad" hidden></p>
+      <button class="btn" id="auth-submit" type="submit">Sign in</button>
+      <button class="btn secondary" id="auth-switch" type="button">Create an account</button>
+    </form>
+  </section>
+  <div class="shell" id="shell" hidden>
+    <aside class="rail">
+      <a class="brand" href="#/">
+        <span class="mark" aria-hidden="true">B</span>
+        <span>
+          <strong>Booth</strong>
+          <small>WhatsApp desk</small>
+        </span>
+      </a>
+      <nav>
+        <a class="nav-link" href="#/" data-nav="fleet">Bots</a>
+        <a class="nav-link" href="#/api" data-nav="api">Model API</a>
+      </nav>
+      <div class="rail-foot">
+        <p id="who"></p>
+        <p id="key-status">No model API key</p>
+        <p id="desk-status" data-state="off">Desk offline</p>
+        <button id="btn-logout" class="rail-logout" type="button">Log out</button>
+      </div>
+    </aside>
+    <div class="stage">
+      <section id="view-fleet">
+        <header class="page-head">
+          <div>
+            <p class="kicker">Desk</p>
+            <h1>Bots</h1>
+            <p class="lede" id="fleet-lede">One bot is one WhatsApp number. Connect it, then decide who it answers.</p>
+          </div>
+          <button class="btn" id="btn-new" type="button">New bot</button>
+        </header>
+        <div id="key-banner" class="banner" hidden>
+          <p>Bots can link without a key, but they stay quiet until you add a model API key.</p>
+          <a class="btn" href="#/api">Add key</a>
+        </div>
+        <div id="fleet-empty" class="steps" hidden>
+          <article class="step">
+            <b>01</b>
+            <h2>Add the model key</h2>
+            <p>Paste a Groq key, or another OpenAI-compatible endpoint.</p>
+            <a class="btn secondary" href="#/api">Open Model API</a>
+          </article>
+          <article class="step">
+            <b>02</b>
+            <h2>Create a bot</h2>
+            <p>Use one bot for each WhatsApp account you want to run.</p>
+            <button class="btn secondary" id="empty-create" type="button">Create a bot</button>
+          </article>
+          <article class="step">
+            <b>03</b>
+            <h2>Scan the QR</h2>
+            <p>WhatsApp on your phone, then Linked devices, then Link a device.</p>
+          </article>
+          <article class="step">
+            <b>04</b>
+            <h2>Set the rules</h2>
+            <p>Choose the voice, the reply limit, and which groups to skip.</p>
+          </article>
+        </div>
+        <div id="fleet-grid" class="grid"></div>
+        <p class="fine">Each connected bot keeps a Chrome process running on this computer.</p>
+      </section>
+
+      <section id="view-api" hidden>
+        <header class="page-head">
+          <div>
+            <p class="kicker">Connection</p>
+            <h1>Model API</h1>
+            <p class="lede">This key belongs to your account. Other people who sign in use their own key. Groq works with the default URL.</p>
+          </div>
+        </header>
+        <form id="api-form" class="panel stack">
+          <label class="field">
+            <span>API URL</span>
+            <input id="api-url" type="url" spellcheck="false" autocomplete="off" required>
+            <small>Default is Groq. You can point this at any OpenAI-compatible <code>/v1</code> URL.</small>
+          </label>
+          <label class="field">
+            <span>API key</span>
+            <span class="key-row">
+              <input id="api-key" type="password" spellcheck="false" autocomplete="off" placeholder="gsk_...">
+              <button class="btn secondary" id="btn-show-key" type="button">Show</button>
+            </span>
+            <small id="api-hint">Nothing saved yet.</small>
+          </label>
+          <p id="api-result" class="notice" hidden></p>
+          <div class="row-actions">
+            <button class="btn" type="submit">Save</button>
+            <button class="btn secondary" id="btn-test-key" type="button">Test key</button>
+            <button class="btn ghost" id="btn-clear-key" type="button" hidden>Remove key</button>
+            <a class="text-link" href="https://console.groq.com" target="_blank" rel="noreferrer">Get a Groq key</a>
+          </div>
+        </form>
+      </section>
+
+      <section id="view-bot" hidden>
+        <header class="bot-head">
+          <a class="back" href="#/">All bots</a>
+          <div>
+            <h1 id="bot-title"></h1>
+            <p id="bot-sub"></p>
+          </div>
+          <div class="bot-actions">
+            <span id="bot-pill" class="pill" data-status="stopped">Idle</span>
+            <button class="btn" id="btn-connect" type="button">Connect</button>
+            <button class="btn secondary" id="btn-stop" type="button" hidden>Stop</button>
+          </div>
+        </header>
+        <nav class="tabs">
+          <a href="#/" data-tab="link">Link</a>
+          <a href="#/" data-tab="chats">Chats</a>
+          <a href="#/" data-tab="behavior">Behavior</a>
+        </nav>
+
+        <div id="panel-link">
+          <div class="layout-link">
+            <div id="link-stage" class="ticket"></div>
+            <section class="panel">
+              <h2>Activity</h2>
+              <ol id="log-list" class="log"></ol>
+            </section>
+          </div>
+        </div>
+
+        <div id="panel-chats" hidden>
+          <p id="chat-locked" class="panel muted">Connect this WhatsApp to load chats.</p>
+          <div id="chat-shell" class="chat-shell" hidden>
+            <div class="chat-side">
+              <div class="chat-tools">
+                <input id="chat-search" type="search" placeholder="Search chats" data-quiet>
+                <button class="btn secondary" id="chat-refresh" type="button">Refresh</button>
+              </div>
+              <div id="chat-list" class="chat-list"></div>
+            </div>
+            <div class="thread-wrap">
+              <header class="thread-head">
+                <h2 id="thread-title">Select a chat</h2>
+                <p id="thread-meta"></p>
+              </header>
+              <div id="thread" class="thread"></div>
+              <form id="composer" class="composer">
+                <textarea id="composer-text" rows="2" placeholder="Write a message from this WhatsApp" disabled></textarea>
+                <button class="btn" id="composer-send" type="submit" disabled>Send</button>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <form id="behavior-form">
+          <div id="panel-behavior" hidden>
+            <section class="panel stack">
+              <h2>Persona</h2>
+              <div class="pair">
+                <label class="field">
+                  <span>Desk name</span>
+                  <input id="set-name" type="text" maxlength="40" required>
+                </label>
+                <label class="field">
+                  <span>Owner name</span>
+                  <input id="set-owner" type="text" maxlength="60">
+                  <small>Used when the custom prompt is empty.</small>
+                </label>
+              </div>
+              <label class="field">
+                <span>Custom prompt</span>
+                <textarea id="set-prompt" placeholder="Leave this empty to use a short busy-assistant prompt based on the owner name."></textarea>
+              </label>
+              <label class="field">
+                <span>Model</span>
+                <input id="set-model" type="text" list="model-options" spellcheck="false" autocomplete="off">
+                <datalist id="model-options"></datalist>
+                <small>After a working key is saved, Test key fills this list from your account.</small>
+              </label>
+            </section>
+
+            <section class="panel stack">
+              <h2>Replies</h2>
+              <label class="switch-row">
+                <span>
+                  <strong>Auto-reply</strong>
+                  <small>Answer ordinary messages. Commands still follow the switch below.</small>
+                </span>
+                <span class="switch"><input id="set-auto" type="checkbox"><span class="switch-ui"></span></span>
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>Commands</strong>
+                  <small><code>--help</code>, <code>--reset</code>, and <code>!ai</code> work even after the reply limit. The word help does the same as --help.</small>
+                </span>
+                <span class="switch"><input id="set-commands" type="checkbox"><span class="switch-ui"></span></span>
+              </label>
+              <div class="pair">
+                <label class="field">
+                  <span>Replies before a pause</span>
+                  <input id="set-max" class="short" type="number" min="1" max="30">
+                </label>
+                <label class="field">
+                  <span>Pause window (minutes)</span>
+                  <input id="set-reset" class="short" type="number" min="1" max="10080">
+                </label>
+              </div>
+              <p class="fine">After the limit, the bot stays quiet until the window passes or the person sends --reset.</p>
+            </section>
+
+            <section class="panel stack">
+              <h2>Who it answers</h2>
+              <p class="fine">These rules stay on this bot. Only your account can see or change them.</p>
+              <label class="switch-row">
+                <span>
+                  <strong>Ignore all groups</strong>
+                  <small>Skip every group chat. Turn this off to reply in groups, then exclude the ones you want left alone.</small>
+                </span>
+                <span class="switch"><input id="set-ignore-groups" type="checkbox"><span class="switch-ui"></span></span>
+              </label>
+              <div id="group-block">
+                <label class="switch-row">
+                  <span>
+                    <strong>Groups only when mentioned</strong>
+                    <small>In groups that are allowed, answer only when this WhatsApp number is mentioned.</small>
+                  </span>
+                  <span class="switch"><input id="set-mention" type="checkbox"><span class="switch-ui"></span></span>
+                </label>
+                <div class="row-actions">
+                  <input id="group-search" type="search" placeholder="Filter groups" data-quiet>
+                  <button class="btn secondary" id="group-refresh" type="button">Refresh groups</button>
+                </div>
+                <p id="group-note" class="fine"></p>
+                <div id="group-list" class="group-list"></div>
+                <div id="group-extras" class="chips"></div>
+              </div>
+              <label class="switch-row">
+                <span>
+                  <strong>Skip saved contacts</strong>
+                  <small>Don't auto-reply to people saved in this phone's contacts. Unsaved numbers still get a reply. --help and !ai still work.</small>
+                </span>
+                <span class="switch"><input id="set-saved" type="checkbox"><span class="switch-ui"></span></span>
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>Ignore business chats</strong>
+                  <small>Skip chats WhatsApp marks as a business account.</small>
+                </span>
+                <span class="switch"><input id="set-business" type="checkbox"><span class="switch-ui"></span></span>
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>Ignore status and broadcasts</strong>
+                  <small>Never answer status updates or broadcast lists.</small>
+                </span>
+                <span class="switch"><input id="set-status" type="checkbox"><span class="switch-ui"></span></span>
+              </label>
+              <div class="field">
+                <span>Never reply to these numbers</span>
+                <div class="add-row">
+                  <input id="num-input" type="text" inputmode="tel" placeholder="9477…" data-quiet autocomplete="off">
+                  <button class="btn secondary" id="num-add" type="button">Add</button>
+                </div>
+                <div id="num-chips" class="chips"></div>
+              </div>
+            </section>
+
+            <section class="panel danger-zone">
+              <div>
+                <h2>Delete this bot</h2>
+                <p>Stops it and removes its saved WhatsApp login from this computer.</p>
+              </div>
+              <button class="btn danger" id="btn-delete" type="button">Delete bot</button>
+            </section>
+
+            <div class="savebar">
+              <span id="dirty-note">Changes apply to the next message. You do not need to reconnect.</span>
+              <button class="btn" id="btn-save" type="submit">Save behavior</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+  </div>
+
+  <dialog id="dlg-create">
+    <form id="create-form" class="dialog-card stack">
+      <h2>New bot</h2>
+      <p>Each bot links a different WhatsApp account.</p>
+      <label class="field">
+        <span>Desk name</span>
+        <input id="create-name" type="text" maxlength="40" required placeholder="Shop line">
+      </label>
+      <label class="field">
+        <span>Owner name</span>
+        <input id="create-owner" type="text" maxlength="60" placeholder="Tharuka">
+      </label>
+      <div class="dialog-actions">
+        <button class="btn secondary" id="create-cancel" type="button">Cancel</button>
+        <button class="btn" type="submit">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-confirm">
+    <form method="dialog" class="dialog-card stack">
+      <h2></h2>
+      <p></p>
+      <div class="dialog-actions">
+        <button class="btn secondary" value="no">Cancel</button>
+        <button class="btn" data-yes value="yes">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
