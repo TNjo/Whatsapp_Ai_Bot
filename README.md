@@ -1,5 +1,7 @@
 # 🤖 WhatsApp AI Assistant - Powered by Llama-3
 
+> **New: WhatsApp AI Business Bot + Order Management platform** — built on the official WhatsApp Cloud API, with a business dashboard for products, conversations and orders. See [`platform/`](platform/README.md). The guide below covers the original personal auto-reply bot.
+
 A personal AI assistant for WhatsApp that auto-replies to your messages when you're busy. Built with Node.js, whatsapp-web.js, and Groq API (Llama-3).
 
 ---
