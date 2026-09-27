@@ -75,11 +75,50 @@ async function api(url, options = {}) {
   return data;
 }
 
+function icon(name, className = '') {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', `icon ${className}`.trim());
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', `#i-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+function initials(name) {
+  const words = String(name || '').replace(/[^\p{L}\p{N}\s]/gu, ' ').trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return '?';
+  const first = [...words[0]][0] || '';
+  const second = words.length > 1 ? ([...words[words.length - 1]][0] || '') : ([...words[0]][1] || '');
+  return (first + second).toUpperCase();
+}
+
+function paintAvatar(el, name, { group = false } = {}) {
+  el.style.setProperty('--h', String(Math.abs(Number(hashText(name))) % 360));
+  el.replaceChildren(group ? icon('users') : document.createTextNode(initials(name)));
+  return el;
+}
+
+function avatar(name, opts = {}) {
+  const el = document.createElement('span');
+  el.className = `avatar ${opts.className || ''}`.trim();
+  el.setAttribute('aria-hidden', 'true');
+  return paintAvatar(el, name, opts);
+}
+
 function toast(message, kind = 'ok') {
   const el = document.getElementById('toast');
   el.hidden = false;
   el.dataset.kind = kind === 'error' ? 'error' : 'ok';
-  el.textContent = message;
+  const badge = document.createElement('span');
+  badge.className = 'toast-icon';
+  badge.append(icon(kind === 'error' ? 'x' : 'check'));
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.replaceChildren(badge, text);
+  el.style.animation = 'none';
+  void el.offsetWidth;
+  el.style.animation = '';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     el.hidden = true;
@@ -135,6 +174,17 @@ function clock(ts) {
   return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
+function shortWhen(ts) {
+  const date = new Date(ts * 1000);
+  if (Number.isNaN(date.getTime())) return '';
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return clock(ts);
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
 function dayLabel(ts) {
   const date = new Date(ts * 1000);
   if (Number.isNaN(date.getTime())) return '';
@@ -159,17 +209,22 @@ function setModels(ids) {
   }
 }
 
-function renderKeyStatus() {
+function renderRail() {
   const el = document.getElementById('key-status');
   el.textContent = state.api.configured ? `Key ending ${state.api.hint}` : 'No model API key';
+  el.dataset.state = state.api.configured ? 'on' : 'off';
   document.getElementById('key-banner').hidden = Boolean(state.api.configured);
+  document.getElementById('nav-count').textContent = state.bots.length ? String(state.bots.length) : '';
+  document.getElementById('stat-key').textContent = state.api.configured ? `…${state.api.hint}` : 'Missing';
+  document.getElementById('stat-key-icon').dataset.tone = state.api.configured ? 'good' : 'bad';
 }
 
 function setDirty(value) {
   dirty = value;
   const note = document.getElementById('dirty-note');
+  document.getElementById('savebar').classList.toggle('is-dirty', value);
   note.textContent = value
-    ? 'Unsaved changes'
+    ? 'You have unsaved changes'
     : 'Changes apply to the next message. You do not need to reconnect.';
 }
 
@@ -180,6 +235,7 @@ function ask({ title, body, confirm, danger }) {
   const yes = dlg.querySelector('[data-yes]');
   yes.textContent = confirm;
   yes.classList.toggle('danger', Boolean(danger));
+  dlg.classList.toggle('is-danger', Boolean(danger));
   return new Promise(resolve => {
     const onClose = () => {
       dlg.removeEventListener('close', onClose);
@@ -203,12 +259,17 @@ function renderFleet() {
     if (waiting) bits.push(`${waiting} waiting for a scan`);
     lede.textContent = bits.join(', ');
   }
+  document.getElementById('stat-total').textContent = String(bots.length);
+  document.getElementById('stat-live').textContent = String(linked);
+  document.getElementById('stat-qr').textContent = String(waiting);
+  document.getElementById('fleet-stats').hidden = bots.length === 0;
+  document.getElementById('btn-new').hidden = bots.length === 0;
   document.getElementById('fleet-empty').hidden = bots.length > 0;
   const grid = document.getElementById('fleet-grid');
   grid.hidden = bots.length === 0;
   grid.replaceChildren();
   for (const bot of bots) grid.append(botCard(bot));
-  renderKeyStatus();
+  renderRail();
 }
 
 function botCard(bot) {
@@ -219,32 +280,58 @@ function botCard(bot) {
   link.className = 'card-link';
   link.href = `#/bots/${bot.id}/link`;
   const top = document.createElement('div');
-  top.append(statusPill(bot));
+  top.className = 'card-top';
+  const heading = document.createElement('div');
+  heading.className = 'card-title';
   const title = document.createElement('h2');
   title.textContent = bot.name;
   const phone = document.createElement('p');
   phone.className = 'phone';
-  phone.textContent = phoneLine(bot);
+  phone.append(icon('phone'), document.createTextNode(phoneLine(bot)));
+  heading.append(title, phone);
+  top.append(avatar(bot.name, { className: 'avatar-sq' }), heading, statusPill(bot));
+
+  const box = document.createElement('div');
+  box.className = 'preview-box';
   const preview = document.createElement('p');
   preview.className = 'preview';
-  preview.textContent = previewLine(bot);
-  link.append(top, title, phone, preview);
+  const last = bot.runtime?.preview;
+  if (last?.body) {
+    const who = last.via === 'bot' ? 'Assistant' : last.fromMe ? 'You' : (last.chatName || 'Chat');
+    const strong = document.createElement('b');
+    strong.textContent = `${who}: `;
+    preview.append(strong, document.createTextNode(last.body));
+  } else {
+    preview.classList.add('is-empty');
+    preview.textContent = previewLine(bot);
+  }
+  box.append(icon(last?.via === 'bot' ? 'sparkles' : 'chat'), preview);
+  link.append(top, box);
 
   const actions = document.createElement('div');
   actions.className = 'card-actions';
+  const open = document.createElement('a');
+  open.className = 'card-open';
+  open.href = `#/bots/${bot.id}/${bot.runtime.status === 'ready' ? 'chats' : 'link'}`;
+  open.append(document.createTextNode(bot.runtime.status === 'ready' ? 'Open chats' : 'Manage'), icon('arrow-right'));
   const live = ['starting', 'qr', 'authenticated', 'ready'].includes(bot.runtime.status);
   const button = document.createElement('button');
   button.type = 'button';
-  button.className = live ? 'btn secondary' : 'btn';
+  button.className = live ? 'btn secondary btn-sm' : 'btn btn-sm';
   button.dataset.action = live ? 'stop' : 'connect';
-  button.textContent = live ? 'Stop' : (bot.runtime.status === 'stopped' ? 'Connect' : 'Reconnect');
-  actions.append(button);
+  button.append(
+    icon(live ? 'stop' : 'play'),
+    document.createTextNode(live ? 'Stop' : (bot.runtime.status === 'stopped' ? 'Connect' : 'Reconnect')),
+  );
+  actions.append(open, button);
   card.append(link, actions);
   return card;
 }
 
 function paintBotChrome(bot) {
   document.getElementById('bot-title').textContent = bot.name;
+  document.getElementById('crumb-name').textContent = bot.name;
+  paintAvatar(document.getElementById('bot-avatar'), bot.name);
   const bits = [];
   const phone = phoneLine(bot);
   if (phone !== 'Not linked yet') bits.push(phone);
@@ -259,7 +346,7 @@ function paintBotChrome(bot) {
   const stop = document.getElementById('btn-stop');
   connect.hidden = live;
   stop.hidden = !live;
-  connect.textContent = bot.runtime.status === 'stopped' ? 'Connect' : 'Reconnect';
+  connect.querySelector('span').textContent = bot.runtime.status === 'stopped' ? 'Connect' : 'Reconnect';
   const route = parseRoute();
   for (const tab of ['link', 'chats', 'behavior']) {
     const el = document.querySelector(`[data-tab="${tab}"]`);
@@ -283,6 +370,7 @@ function renderLogs(bot) {
   const lines = bot.runtime.logs || [];
   if (!lines.length) {
     const item = document.createElement('li');
+    item.className = 'log-empty';
     item.textContent = 'Nothing yet. Connect this bot to begin.';
     list.append(item);
     return;
@@ -310,38 +398,72 @@ function renderLink(bot) {
     const status = bot.runtime.status;
     const title = document.createElement('h2');
     const copy = document.createElement('p');
+    const badge = (name, tone, spin) => {
+      const el = document.createElement('span');
+      el.className = spin ? 'ticket-icon is-spinning' : 'ticket-icon';
+      if (tone) el.dataset.tone = tone;
+      el.append(icon(name));
+      return el;
+    };
     if (status === 'qr' && qr.startsWith('data:image/')) {
+      const frame = document.createElement('div');
+      frame.className = 'qr-frame';
       const img = document.createElement('img');
       img.alt = 'WhatsApp QR code';
       img.src = qr;
+      frame.append(img);
       title.textContent = 'Scan to link';
-      copy.textContent = 'On your phone open WhatsApp, then Settings, Linked devices, Link a device. The code refreshes by itself.';
-      stage.append(img, title, copy);
+      const steps = document.createElement('ol');
+      steps.className = 'qr-steps';
+      for (const parts of [
+        ['Open ', 'WhatsApp', ' on your phone'],
+        ['Go to ', 'Settings → Linked devices', ''],
+        ['Tap ', 'Link a device', ' and point at this code'],
+      ]) {
+        const li = document.createElement('li');
+        const span = document.createElement('span');
+        const strong = document.createElement('b');
+        strong.textContent = parts[1];
+        span.append(document.createTextNode(parts[0]), strong, document.createTextNode(parts[2]));
+        li.append(span);
+        steps.append(li);
+      }
+      const note = document.createElement('p');
+      note.className = 'fine';
+      note.textContent = 'The code refreshes by itself.';
+      stage.append(frame, title, steps, note);
     } else if (status === 'starting') {
       title.textContent = 'Opening WhatsApp';
       copy.textContent = 'Chrome is starting in the background. A QR code shows here if this number is not saved yet.';
-      stage.append(title, copy);
+      stage.append(badge('loader', 'warn', true), title, copy);
     } else if (status === 'authenticated') {
       title.textContent = 'Phone linked';
       copy.textContent = 'WhatsApp is loading this account. Chats appear when it finishes.';
-      stage.append(title, copy);
+      stage.append(badge('loader', 'warn', true), title, copy);
     } else if (status === 'ready') {
       title.textContent = bot.linked?.pushname || bot.name;
       copy.textContent = `${phoneLine(bot)} is connected. Messages in the Chats tab update live.`;
-      stage.append(title, copy, unlinkButton());
+      const chats = document.createElement('a');
+      chats.className = 'btn';
+      chats.href = `#/bots/${bot.id}/chats`;
+      chats.append(icon('chat'), document.createTextNode('Open chats'));
+      const row = document.createElement('div');
+      row.className = 'row-actions';
+      row.append(chats, unlinkButton());
+      stage.append(badge('check-circle', 'good'), title, copy, row);
     } else if (status === 'error' || status === 'disconnected') {
       title.textContent = status === 'error' ? 'Could not stay connected' : 'Disconnected';
       copy.textContent = bot.runtime.error || 'Press Reconnect to try again.';
-      stage.append(title, copy);
+      stage.append(badge('alert', 'bad'), title, copy);
       if (bot.linked) stage.append(unlinkButton());
     } else if (bot.linked?.wid) {
       title.textContent = 'Saved login';
       copy.textContent = `${phoneLine(bot)} is saved on this computer. Connect to bring it back without a new scan.`;
-      stage.append(title, copy, unlinkButton());
+      stage.append(badge('phone'), title, copy, unlinkButton());
     } else {
       title.textContent = 'Waiting to link';
       copy.textContent = 'Connect this bot. If the number is new here, a QR code appears in this card.';
-      stage.append(title, copy);
+      stage.append(badge('qr'), title, copy);
     }
   }
   renderLogs(bot);
@@ -352,7 +474,7 @@ function unlinkButton() {
   button.type = 'button';
   button.className = 'btn secondary';
   button.dataset.unlink = '1';
-  button.textContent = 'Unlink device';
+  button.append(icon('unlink'), document.createTextNode('Unlink device'));
   return button;
 }
 
@@ -383,7 +505,7 @@ function applyRoute() {
   if (route.name === 'api') {
     document.title = 'Model API · Booth';
     paintApi();
-    renderKeyStatus();
+    renderRail();
     return;
   }
 
@@ -478,7 +600,7 @@ function renderNumbers() {
     chip.append(document.createTextNode(`+${number}`));
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = '×';
+    button.append(icon('x'));
     button.setAttribute('aria-label', `Remove +${number}`);
     button.addEventListener('click', () => {
       draftNumbers = draftNumbers.filter(item => item !== number);
@@ -509,18 +631,28 @@ function renderGroups() {
     input.checked = !excluded;
     input.setAttribute('aria-label', `Reply in ${group.name}`);
     const name = document.createElement('span');
+    name.className = 'group-name';
     name.textContent = group.name;
     const flag = document.createElement('span');
-    flag.className = 'fine';
-    flag.textContent = excluded ? 'Skipped' : 'Replies';
+    flag.className = 'group-flag';
+    const paintFlag = () => {
+      flag.textContent = input.checked ? 'Replies' : 'Skipped';
+      flag.dataset.on = String(input.checked);
+    };
+    paintFlag();
     input.addEventListener('change', () => {
       if (input.checked) draftGroups = draftGroups.filter(item => item.id !== group.id);
       else if (!draftGroups.some(item => item.id === group.id)) draftGroups.push({ id: group.id, name: group.name });
-      flag.textContent = input.checked ? 'Replies' : 'Skipped';
+      paintFlag();
       note.textContent = `${draftGroups.length} group${draftGroups.length === 1 ? '' : 's'} excluded.`;
       setDirty(true);
     });
-    label.append(input, name, flag);
+    const toggle = document.createElement('span');
+    toggle.className = 'switch';
+    const ui = document.createElement('span');
+    ui.className = 'switch-ui';
+    toggle.append(input, ui);
+    label.append(avatar(group.name, { group: true }), name, flag, toggle);
     root.append(label);
   }
 
@@ -533,7 +665,7 @@ function renderGroups() {
     chip.append(document.createTextNode(group.name || group.id));
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = '×';
+    button.append(icon('x'));
     button.setAttribute('aria-label', `Remove ${group.name || 'group'}`);
     button.addEventListener('click', () => {
       draftGroups = draftGroups.filter(item => item.id !== group.id);
@@ -597,7 +729,8 @@ function bubble(msg) {
   if (who) {
     const label = document.createElement('span');
     label.className = 'who';
-    label.textContent = who;
+    if (kind === 'bot') label.append(icon('sparkles'));
+    label.append(document.createTextNode(who));
     el.append(label);
   }
   const text = document.createElement('p');
@@ -660,23 +793,36 @@ function renderChatList() {
     button.className = 'chat-row';
     button.dataset.chat = chat.id;
     if (chat.id === current) button.setAttribute('aria-current', 'true');
+    const main = document.createElement('span');
+    main.className = 'chat-row-main';
+    const top = document.createElement('span');
+    top.className = 'chat-row-top';
     const title = document.createElement('strong');
     title.textContent = chat.name || 'Chat';
+    const time = document.createElement('span');
+    time.className = 'chat-time';
+    time.textContent = chat.timestamp ? shortWhen(chat.timestamp) : '';
+    top.append(title, time);
+    const bottom = document.createElement('span');
+    bottom.className = 'chat-row-bottom';
+    const preview = document.createElement('span');
+    preview.className = 'chat-snippet';
+    preview.textContent = (chat.lastMessage || 'No text yet').replace(/\u2060/g, '');
+    bottom.append(preview);
     if (chat.isGroup) {
       const tag = document.createElement('span');
       tag.className = 'tag';
       tag.textContent = 'Group';
-      title.append(tag);
+      bottom.append(tag);
     }
     if (chat.unread) {
       const badge = document.createElement('span');
       badge.className = 'unread';
       badge.textContent = String(chat.unread);
-      title.append(badge);
+      bottom.append(badge);
     }
-    const preview = document.createElement('span');
-    preview.textContent = (chat.lastMessage || 'No text yet').replace(/\u2060/g, '');
-    button.append(title, preview);
+    main.append(top, bottom);
+    button.append(avatar(chat.name || 'Chat', { group: chat.isGroup }), main);
     list.append(button);
   }
   list.scrollTop = scroll;
@@ -685,6 +831,9 @@ function renderChatList() {
 function paintThreadHead(chat) {
   document.getElementById('thread-title').textContent = chat ? (chat.name || 'Chat') : 'Select a chat';
   document.getElementById('thread-meta').textContent = chat ? (chat.isGroup ? 'Group' : 'Personal chat') : '';
+  const face = document.getElementById('thread-avatar');
+  if (chat) paintAvatar(face, chat.name || 'Chat', { group: chat.isGroup });
+  else face.replaceChildren();
   const ready = currentBot()?.runtime.status === 'ready' && Boolean(chat);
   document.getElementById('composer-text').disabled = !ready;
   document.getElementById('composer-send').disabled = !ready;
@@ -765,7 +914,7 @@ async function loadChats(botId) {
     chatRetryAt = Date.now() + 4000;
     document.getElementById('chat-locked').hidden = false;
     document.getElementById('chat-shell').hidden = true;
-    document.getElementById('chat-locked').textContent = err.message;
+    document.getElementById('chat-locked-text').textContent = err.message;
   }
 }
 
@@ -775,7 +924,7 @@ function ensureChats(bot) {
   if (bot.runtime.status !== 'ready') {
     locked.hidden = false;
     shell.hidden = true;
-    locked.textContent = 'Connect this WhatsApp to load chats.';
+    document.getElementById('chat-locked-text').textContent = 'Connect this WhatsApp to load chats.';
     if (chatsLoaded === bot.id) chatsLoaded = null;
     return;
   }
@@ -856,7 +1005,7 @@ async function refreshModels() {
 
 async function refresh() {
   state = await api('/api/state');
-  renderKeyStatus();
+  renderRail();
   applyRoute();
 }
 
@@ -888,7 +1037,27 @@ function onLiveMessage({ botId, message, preview }) {
   }
 }
 
+function currentTheme() {
+  const set = document.documentElement.dataset.theme;
+  if (set === 'light' || set === 'dark') return set;
+  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
 function bind() {
+  document.getElementById('btn-theme').addEventListener('click', () => {
+    const next = currentTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try {
+      localStorage.setItem('booth-theme', next);
+    } catch {
+      // theme still applies for this visit
+    }
+  });
+  const composerText = document.getElementById('composer-text');
+  composerText.addEventListener('input', () => {
+    composerText.style.height = 'auto';
+    composerText.style.height = `${Math.min(composerText.scrollHeight + 2, 160)}px`;
+  });
   document.getElementById('btn-new').addEventListener('click', openCreate);
   document.getElementById('empty-create').addEventListener('click', openCreate);
   document.getElementById('create-cancel').addEventListener('click', () => {
@@ -976,7 +1145,7 @@ function bind() {
       state.api = data.api;
       document.getElementById('api-key').value = '';
       paintApi();
-      renderKeyStatus();
+      renderRail();
       toast(state.api.configured ? 'Model API saved' : 'URL saved');
       refreshModels();
     } catch (err) {
@@ -987,7 +1156,7 @@ function bind() {
     const input = document.getElementById('api-key');
     const show = input.type === 'password';
     input.type = show ? 'text' : 'password';
-    document.getElementById('btn-show-key').textContent = show ? 'Hide' : 'Show';
+    document.querySelector('#btn-show-key span').textContent = show ? 'Hide' : 'Show';
   });
   document.getElementById('btn-test-key').addEventListener('click', async () => {
     const result = document.getElementById('api-result');
@@ -1034,7 +1203,7 @@ function bind() {
       state.api = data.api;
       document.getElementById('api-key').value = '';
       paintApi();
-      renderKeyStatus();
+      renderRail();
       toast('API key removed');
     } catch (err) {
       toast(err.message, 'error');
@@ -1180,6 +1349,7 @@ function bind() {
         body: JSON.stringify({ body: text }),
       });
       input.value = '';
+      input.style.height = '';
       if (data.message) {
         mergeMessages(bot.id, chatId, [data.message]);
         touchChatList(bot.id, data.message);
@@ -1321,8 +1491,9 @@ async function enterDesk() {
   document.getElementById('boot').hidden = true;
   document.getElementById('shell').hidden = false;
   document.getElementById('who').textContent = state.user?.username || '';
+  if (state.user?.username) paintAvatar(document.getElementById('who-avatar'), state.user.username);
   setModels(PRESET_MODELS);
-  renderKeyStatus();
+  renderRail();
   connectSocket();
   appliedHash = location.hash || '#/';
   applyRoute();
@@ -1352,7 +1523,8 @@ async function boot() {
     }
     await enterDesk();
   } catch {
-    document.getElementById('boot').textContent = 'The desk did not start. Run npm start, then open this page again.';
+    document.getElementById('boot').classList.add('is-failed');
+    document.getElementById('boot-text').textContent = 'The desk did not start. Run npm start, then open this page again.';
   }
 }
 
