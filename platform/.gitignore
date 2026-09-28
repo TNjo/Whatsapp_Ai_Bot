@@ -43,3 +43,10 @@ next-env.d.ts
 
 # local data (embedded database, uploads, dev keys)
 /.data
+
+# firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+*-firebase-adminsdk-*.json
+service-account*.json

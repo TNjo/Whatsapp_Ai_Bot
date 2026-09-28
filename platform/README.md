@@ -2,10 +2,7 @@
 
 A web platform that connects **one WhatsApp Business number per business** to an AI assistant. The assistant answers from the business's real catalog, collects orders over WhatsApp, and the owner confirms and ships them from a dashboard. Customers get automatic WhatsApp updates at every step.
 
-Two ways to connect a number:
-
-- **WhatsApp Business API (official, recommended)** — Meta's Cloud API via Embedded Signup or a System User token.
-- **Linked device by QR code (unofficial)** — any normal WhatsApp number (personal or the WhatsApp Business app), linked like WhatsApp Web. See [Linking a normal WhatsApp number](#linking-a-normal-whatsapp-number-qr).
+Built on the **official Meta WhatsApp Cloud API** — WhatsApp Business accounts only (no unofficial automation).
 
 ## What it does
 
@@ -26,20 +23,31 @@ Two ways to connect a number:
 
 ## Quick start (local)
 
+The database is **Cloud Firestore** (Firebase project `business-automations-1e2b2`). The server talks to it with the Firebase Admin SDK, so it needs a **service account key** — the web config (`apiKey`, `appId`, …) isn't used.
+
+1. Firebase console → **Build → Firestore Database** → create the database (Native mode) if it doesn't exist yet.
+2. Firebase console → **Project settings → Service accounts → Generate new private key**. Keep the JSON file private — never commit it.
+3. Configure and run:
+
 ```bash
 cd platform
 npm install
-cp .env.example .env.local   # optional for a first look
+cp .env.example .env.local
+# In .env.local set FIREBASE_SERVICE_ACCOUNT to the key JSON (one line, or base64 of the file),
+# or FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY. FIREBASE_PROJECT_ID is already filled in.
+npm run firestore:deploy     # once: uploads firestore.indexes.json + firestore.rules (asks you to sign in to Firebase)
 npm run dev                  # http://localhost:3000
 ```
 
-Without `DATABASE_URL` the app uses an **embedded PostgreSQL (PGlite)** stored in `.data/`, so no database server is needed for development. Migrations run automatically on start.
+No credentials yet? `FIREBASE_USE_MEMORY=true npm run dev` runs on a throwaway in-memory database (everything is lost on restart).
+
+Then:
 
 1. Register a business at `/register`.
 2. **Settings → Load sample catalog** to get a clothing-store catalog to try things with.
 3. **Bot** → add an AI API key (or set `AI_API_KEY` in `.env.local`).
 4. **Bot → Test bot** — try “Do you have black t-shirts?”, place an order, then ask “Where is my order?”.
-5. **WhatsApp** → connect your number when you're ready for real customers.
+5. **WhatsApp** → connect your WhatsApp Business number when you're ready for real customers.
 
 ## Connecting WhatsApp (Meta setup)
 
@@ -50,29 +58,13 @@ Without `DATABASE_URL` the app uses an **embedded PostgreSQL (PGlite)** stored i
 5. **Or** paste a permanent System User token + phone number ID + WABA ID under *Connect with an access token* (or set `WHATSAPP_*` env vars and use *Use server credentials*).
 6. Create message templates (order confirmed, dispatched, …) in WhatsApp Manager, then **WhatsApp → Templates → Sync from Meta** and map each one to its purpose and variables.
 
-## Linking a normal WhatsApp number (QR)
-
-For numbers that aren't on the WhatsApp Business API, **WhatsApp → Link a normal WhatsApp number** shows a QR code. Scan it from the phone (WhatsApp → Linked devices → Link a device) and the same assistant, inbox, orders and notifications work on that number.
-
-> ⚠️ **Unofficial.** This automates WhatsApp Web (whatsapp-web.js + headless Chrome), which WhatsApp's terms don't allow. WhatsApp may restrict or ban numbers that send automated messages. Avoid bulk or unsolicited messages and use the official API for important numbers. The dashboard asks the owner to acknowledge this before linking.
-
-How it differs from the official API:
-
-- Runs a headless Chrome **inside the app server** per linked business; the session is saved in `.data/wa-web/` and reconnects automatically after a restart (no new scan). Needs a long-running server with enough memory (~200–300 MB per linked number) — not serverless.
-- No 24-hour window and no templates: order updates can always be sent.
-- Buttons and lists are sent as numbered options; customers reply “1”, “2”… or the option's name.
-- When the owner replies from the phone, the message appears in the inbox and the AI pauses for that chat (human takeover).
-- Hidden-number contacts (`@lid`) are resolved to their phone number when WhatsApp shares it.
-- Unlinking logs the device out on WhatsApp and deletes the saved session. If the phone removes the device, the owner is notified.
-- Set `WHATSAPP_WEB_DISABLED=true` to stop linked devices from reconnecting on start.
-
 ## Environment
 
 See [`.env.example`](.env.example). Required in production:
 
 | Variable | Why |
 | --- | --- |
-| `DATABASE_URL` | PostgreSQL connection string |
+| `FIREBASE_SERVICE_ACCOUNT` (or `FIREBASE_PROJECT_ID` + `FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY`) | Firestore access for the server. On Google Cloud, `FIREBASE_PROJECT_ID` alone uses the runtime's credentials |
 | `ENCRYPTION_KEY` | 32 bytes (base64). Encrypts WhatsApp tokens and AI keys at rest (AES-256-GCM) |
 | `APP_URL` | Public HTTPS URL (webhook URL, links) |
 | `META_APP_ID`, `META_APP_SECRET`, `META_WEBHOOK_VERIFY_TOKEN` | Webhook signature verification and Embedded Signup |
@@ -97,10 +89,10 @@ Meta Cloud API ──► /api/webhooks/whatsapp (HMAC verified, 200 immediately,
               outbound.ts    — every outgoing message: stored → 24h window / template check → WhatsAppMessagingService → status
 ```
 
-- **Database:** Drizzle ORM on PostgreSQL (`src/db/schema.ts`, migrations in `drizzle/`). Every business-owned row has `business_id`; every query is scoped by the business from the session or the verified webhook phone number — never from the request body.
+- **Database:** Cloud Firestore through the Firebase Admin SDK. The data model is documented at the top of `src/db/schema.ts`: accounts at the top level, everything a business owns under `businesses/{businessId}/…`, so isolation follows from the path. The business id always comes from the session or the verified webhook phone number — never from the request body. Unique ids double as constraints (customer id = WhatsApp id, one conversation per customer, a `waMessages` index dedupes webhooks). Composite indexes live in `firestore.indexes.json`; `firestore.rules` denies all direct browser access (only the server reads and writes).
 - **Order safety:** an order is created only after the review was shown, the customer's confirmation arrived *after* it, and the draft is unchanged since (hash check). Stock is reserved on creation and released on reject/cancel.
-- **Real-time:** an in-process event bus streamed over SSE. For more than one server instance, swap `src/server/events.ts` for Postgres `LISTEN/NOTIFY` or Redis.
-- **Security:** session cookies (HttpOnly, SameSite=Lax) with server-side sessions, scrypt passwords, owner/staff roles, same-origin checks on mutations, Zod validation on every API, rate limits (Postgres-backed), audit log of every change, webhook signature verification.
+- **Real-time:** an in-process event bus streamed over SSE. For more than one server instance, swap `src/server/events.ts` for Firestore listeners, Pub/Sub or Redis.
+- **Security:** session cookies (HttpOnly, SameSite=Lax) with server-side sessions, scrypt passwords, owner/staff roles, same-origin checks on mutations, Zod validation on every API, rate limits (Firestore-backed), audit log of every change, webhook signature verification.
 
 ## Scripts
 
@@ -110,16 +102,19 @@ npm run build        # production build
 npm run start        # serve the build
 npm run typecheck    # route types + tsc
 npm run lint         # eslint
-npm test             # end-to-end tests (mock Meta Graph API, fake WhatsApp Web client, scripted AI, in-memory Postgres)
-npm run db:generate  # new migration after editing src/db/schema.ts
+npm test             # end-to-end tests (mock Meta Graph API, scripted AI, in-memory Firestore)
+npm run firestore:deploy   # deploy firestore.indexes.json + firestore.rules to the Firebase project
 ```
 
-`npm test` runs the full acceptance flow — customer says hi → asks about products → orders → confirms → owner confirms/dispatches/completes → customer asks “Where is my order?” — plus webhook signature, idempotency, stale-review, handoff, 24-hour-window/template, tenant-isolation and send-failure cases, and the Claude / OpenAI-compatible wire formats.
+`npm test` runs on an in-memory Firestore that rejects queries missing from `firestore.indexes.json` and transactions that read after writing, so it also guards against surprises on real Firestore. It covers the full acceptance flow — customer says hi → asks about products → orders → confirms → owner confirms/dispatches/completes → customer asks “Where is my order?” — plus webhook signature, idempotency, stale-review, handoff, 24-hour-window/template, tenant-isolation and send-failure cases, and the Claude / OpenAI-compatible wire formats.
 
 ## Limits of this version
 
-- One WhatsApp number per business (by design for the MVP) — either the official API or a linked device, not both.
-- Real-time events and the embedded database are single-process. Use `DATABASE_URL` and one app instance (or replace the event bus) for production.
+- One WhatsApp number per business (by design for the MVP).
+- Real-time events use an in-process bus: run one app instance (or replace the event bus) for production.
+- Firestore has no substring search: order, inbox and customer search scan the most recent records (hundreds) in memory — fine for a single business, worth replacing with a search service at large scale.
+- The test suite runs on an in-memory Firestore that also enforces Firestore's index and transaction rules; run it against the Firestore emulator (needs Java) for full fidelity.
+- Optional: add Firestore TTL policies on `sessions.expiresAt` and `rateLimits.expireAt` to clean up old documents automatically.
 - Incoming media is streamed from WhatsApp on demand, not stored; WhatsApp keeps it for about 30 days.
 - The knowledge base is FAQs + notes; the schema (`bot_knowledge.kind`) leaves room for document upload / RAG later.
 - Embedded Signup requires your Meta app to be set up as a Tech Provider and approved for the WhatsApp permissions.

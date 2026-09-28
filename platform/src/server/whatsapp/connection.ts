@@ -1,12 +1,10 @@
 import "server-only";
 import crypto from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { getDb } from "@/db";
+import { fromDoc, store } from "@/db";
 import {
-  botSettings,
-  whatsappConnections,
-  whatsappPhoneNumbers,
-  whatsappTemplates,
+  type BotSettings,
+  type WhatsAppConnection,
+  type WhatsAppTemplate,
   type HealthCheck,
   type TemplatePurpose,
 } from "@/db/schema";
@@ -32,15 +30,12 @@ type PhoneInfo = {
   status?: string;
 };
 
+/** businesses/{b}/settings/whatsapp — the connection, with its phone number embedded. */
 export async function getConnection(businessId: string) {
-  const db = await getDb();
-  const [connection] = await db.select().from(whatsappConnections).where(eq(whatsappConnections.businessId, businessId));
+  const s = await store();
+  const connection = fromDoc<WhatsAppConnection & { id: string }>(await s.whatsapp(businessId).get());
   if (!connection) return null;
-  const phones = await db
-    .select()
-    .from(whatsappPhoneNumbers)
-    .where(eq(whatsappPhoneNumbers.connectionId, connection.id));
-  return { connection, phone: phones.find((p) => p.isPrimary) ?? phones[0] ?? null };
+  return { connection, phone: connection.phone };
 }
 
 /** Browser-safe view of the connection. Never includes tokens. */
@@ -56,16 +51,12 @@ export async function connectionView(businessId: string) {
     appSecretSet: Boolean(env.meta.appSecret),
     serverCredentialsAvailable: Boolean(env.whatsapp.accessToken && env.whatsapp.phoneNumberId && env.whatsapp.businessAccountId),
   };
-  const { linkState } = await import("./web");
-  const link = linkState(businessId);
   if (!found) {
-    return { status: "disconnected" as const, mode: null, link, setup, connection: null };
+    return { status: "disconnected" as const, setup, connection: null };
   }
   const { connection, phone } = found;
   return {
     status: connection.status,
-    mode: connection.connectedVia === "qr" ? ("qr" as const) : connection.connectedVia ? ("cloud" as const) : null,
-    link,
     setup,
     connection: {
       connectedVia: connection.connectedVia,
@@ -88,7 +79,7 @@ export async function connectionView(businessId: string) {
 /** Decrypted credentials for sending. Only ever used server-side. */
 export async function getCredentials(businessId: string): Promise<(Credentials & { wabaId: string | null }) | null> {
   const found = await getConnection(businessId);
-  if (!found || found.connection.status !== "connected" || found.connection.connectedVia === "qr" || !found.phone) return null;
+  if (!found || found.connection.status !== "connected" || !found.phone) return null;
   const accessToken = decryptSecret(found.connection.accessTokenEnc);
   if (!accessToken) return null;
   return { accessToken, phoneNumberId: found.phone.phoneNumberId, wabaId: found.connection.wabaId };
@@ -107,14 +98,11 @@ export async function getMessagingService(businessId: string) {
   return service;
 }
 
-/** Resolves the business that owns an incoming webhook's phone number id. */
+/** Resolves the business that owns an incoming webhook's phone number id (phoneNumbers/{id}). */
 export async function businessForPhoneNumberId(phoneNumberId: string) {
-  const db = await getDb();
-  const [row] = await db
-    .select({ businessId: whatsappPhoneNumbers.businessId, connectionId: whatsappPhoneNumbers.connectionId })
-    .from(whatsappPhoneNumbers)
-    .where(eq(whatsappPhoneNumbers.phoneNumberId, phoneNumberId));
-  return row ?? null;
+  const s = await store();
+  const row = (await s.phoneNumbers.doc(phoneNumberId).get()).data() as { businessId: string } | undefined;
+  return row ? { businessId: row.businessId } : null;
 }
 
 type ConnectInput = {
@@ -126,12 +114,31 @@ type ConnectInput = {
   pin?: string;
 };
 
-async function setStatus(businessId: string, values: Partial<typeof whatsappConnections.$inferInsert>) {
-  const db = await getDb();
-  await db
-    .insert(whatsappConnections)
-    .values({ businessId, ...values })
-    .onConflictDoUpdate({ target: whatsappConnections.businessId, set: values });
+const EMPTY_CONNECTION: Omit<WhatsAppConnection, "createdAt" | "updatedAt"> = {
+  status: "disconnected",
+  connectedVia: null,
+  wabaId: null,
+  wabaName: null,
+  accessTokenEnc: null,
+  tokenExpiresAt: null,
+  registrationPinEnc: null,
+  phone: null,
+  health: [],
+  lastHealthCheckAt: null,
+  lastWebhookEventAt: null,
+  lastError: null,
+  connectedAt: null,
+};
+
+async function setStatus(businessId: string, values: Partial<WhatsAppConnection>) {
+  const s = await store();
+  const ref = s.whatsapp(businessId);
+  await s.db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const now = new Date();
+    if (snap.exists) tx.update(ref, { ...values, updatedAt: now });
+    else tx.set(ref, { ...EMPTY_CONNECTION, ...values, createdAt: now, updatedAt: now });
+  });
   publish(businessId, { type: "whatsapp.updated" });
 }
 
@@ -141,11 +148,6 @@ async function setStatus(businessId: string, values: Partial<typeof whatsappConn
  * encrypted. Throws an ApiError with a readable message when anything fails.
  */
 async function finishConnection(businessId: string, input: ConnectInput, actor: AuditActor) {
-  const db = await getDb();
-  const current = await getConnection(businessId);
-  if (current?.connection.connectedVia === "qr" && current.connection.status !== "disconnected") {
-    throw new ApiError(409, "Unlink the linked WhatsApp (QR) before connecting the WhatsApp Business API.");
-  }
   await setStatus(businessId, { status: "connecting", lastError: null });
 
   // The number may belong to another business on this platform — refuse rather than hijack it.
@@ -206,24 +208,32 @@ async function finishConnection(businessId: string, input: ConnectInput, actor: 
     tokenExpiresAt: input.tokenExpiresIn ? new Date(Date.now() + input.tokenExpiresIn * 1000) : null,
     lastError: null,
     connectedAt: new Date(),
-    ...(pinEnc ? { registrationPinEnc: pinEnc } : {}),
   };
 
-  await db.transaction(async (tx) => {
-    const [connection] = await tx
-      .insert(whatsappConnections)
-      .values({ businessId, ...values })
-      .onConflictDoUpdate({ target: whatsappConnections.businessId, set: values })
-      .returning();
-    await tx.delete(whatsappPhoneNumbers).where(eq(whatsappPhoneNumbers.businessId, businessId));
-    await tx.insert(whatsappPhoneNumbers).values({
-      businessId,
-      connectionId: connection.id,
-      phoneNumberId: input.phoneNumberId,
-      displayPhoneNumber: phone.display_phone_number ?? "",
-      verifiedName: phone.verified_name ?? "",
-      qualityRating: phone.quality_rating ?? null,
-      isPrimary: true,
+  const s = await store();
+  const phoneRef = s.phoneNumbers.doc(input.phoneNumberId);
+  const connectionRef = s.whatsapp(businessId);
+  await s.db.runTransaction(async (tx) => {
+    const [claim, currentSnap] = await tx.getAll(phoneRef, connectionRef);
+    const claimedBy = (claim.data() as { businessId?: string } | undefined)?.businessId;
+    if (claimedBy && claimedBy !== businessId) throw new ApiError(409, "This WhatsApp number is already connected to another business.");
+    const current = fromDoc<WhatsAppConnection & { id: string }>(currentSnap);
+    // Switching numbers: release the old one.
+    if (current?.phone && current.phone.phoneNumberId !== input.phoneNumberId) tx.delete(s.phoneNumbers.doc(current.phone.phoneNumberId));
+    const now = new Date();
+    tx.set(phoneRef, { businessId, createdAt: now });
+    tx.set(connectionRef, {
+      ...EMPTY_CONNECTION,
+      ...(current ? { lastWebhookEventAt: current.lastWebhookEventAt, createdAt: current.createdAt } : { createdAt: now }),
+      ...values,
+      registrationPinEnc: pinEnc ?? current?.registrationPinEnc ?? null,
+      phone: {
+        phoneNumberId: input.phoneNumberId,
+        displayPhoneNumber: phone.display_phone_number ?? "",
+        verifiedName: phone.verified_name ?? "",
+        qualityRating: phone.quality_rating ?? null,
+      },
+      updatedAt: now,
     });
   });
 
@@ -284,33 +294,28 @@ export async function connectManually(
 export async function disconnect(businessId: string, actor: AuditActor) {
   const found = await getConnection(businessId);
   if (!found) return connectionView(businessId);
-  if (found.connection.connectedVia === "qr") {
-    const { unlinkWeb } = await import("./web");
-    await unlinkWeb(businessId);
-  }
   const token = decryptSecret(found.connection.accessTokenEnc);
   if (token && found.connection.wabaId) {
     await graph(`${found.connection.wabaId}/subscribed_apps`, { token, method: "DELETE" }).catch((err) =>
       log.warn("whatsapp.unsubscribe_failed", { businessId, err }),
     );
   }
-  const db = await getDb();
-  await db.transaction(async (tx) => {
-    await tx.delete(whatsappPhoneNumbers).where(eq(whatsappPhoneNumbers.businessId, businessId));
-    await tx
-      .update(whatsappConnections)
-      .set({
-        status: "disconnected",
-        connectedVia: null,
-        accessTokenEnc: null,
-        registrationPinEnc: null,
-        tokenExpiresAt: null,
-        health: [],
-        lastError: null,
-        connectedAt: null,
-      })
-      .where(eq(whatsappConnections.businessId, businessId));
+  const s = await store();
+  const batch = s.db.batch();
+  if (found.phone) batch.delete(s.phoneNumbers.doc(found.phone.phoneNumberId));
+  batch.update(s.whatsapp(businessId), {
+    status: "disconnected",
+    connectedVia: null,
+    accessTokenEnc: null,
+    registrationPinEnc: null,
+    tokenExpiresAt: null,
+    phone: null,
+    health: [],
+    lastError: null,
+    connectedAt: null,
+    updatedAt: new Date(),
   });
+  await batch.commit();
   messagingCache.delete(businessId);
   publish(businessId, { type: "whatsapp.updated" });
   await audit(businessId, actor, "whatsapp.disconnected", { type: "whatsapp_connection" });
@@ -319,15 +324,9 @@ export async function disconnect(businessId: string, actor: AuditActor) {
 
 /** Connection Health (spec §6): account, phone, API access, webhook, messaging, bot. */
 export async function runHealthCheck(businessId: string): Promise<HealthCheck[]> {
-  const db = await getDb();
+  const s = await store();
   const found = await getConnection(businessId);
   if (!found) return [];
-  if (found.connection.connectedVia === "qr") {
-    const { webHealthCheck } = await import("./web");
-    const checks = await webHealthCheck(businessId);
-    publish(businessId, { type: "whatsapp.updated" });
-    return checks;
-  }
   const { connection, phone } = found;
   const token = decryptSecret(connection.accessTokenEnc);
   const checks: HealthCheck[] = [];
@@ -354,10 +353,9 @@ export async function runHealthCheck(businessId: string): Promise<HealthCheck[]>
           : "The number is not registered for the Cloud API yet.",
       );
       if (info.quality_rating && info.quality_rating !== phone.qualityRating) {
-        await db
-          .update(whatsappPhoneNumbers)
-          .set({ qualityRating: info.quality_rating, displayPhoneNumber: info.display_phone_number ?? phone.displayPhoneNumber })
-          .where(eq(whatsappPhoneNumbers.id, phone.id));
+        await s.whatsapp(businessId).update({
+          phone: { ...phone, qualityRating: info.quality_rating, displayPhoneNumber: info.display_phone_number ?? phone.displayPhoneNumber },
+        });
       }
     } catch (err) {
       const detail = err instanceof GraphError ? err.friendly : "Could not reach WhatsApp.";
@@ -429,7 +427,7 @@ export async function runHealthCheck(businessId: string): Promise<HealthCheck[]>
     push("messaging", "Messaging", false, "Messaging cannot be verified until API access works.");
   }
 
-  const [settings] = await db.select().from(botSettings).where(eq(botSettings.businessId, businessId));
+  const settings = fromDoc<BotSettings & { id: string }>(await s.bot(businessId).get());
   const aiConfig = resolveAIConfig(settings ?? null);
   push(
     "bot",
@@ -440,15 +438,13 @@ export async function runHealthCheck(businessId: string): Promise<HealthCheck[]>
 
   const order: HealthCheck["key"][] = ["account", "phone", "api", "webhook", "messaging", "bot"];
   checks.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
-  await db
-    .update(whatsappConnections)
-    .set({
-      health: checks,
-      lastHealthCheckAt: new Date(),
-      status: apiOk ? "connected" : "error",
-      lastError: apiOk ? null : checks.find((check) => check.key === "api")?.detail ?? null,
-    })
-    .where(eq(whatsappConnections.businessId, businessId));
+  await s.whatsapp(businessId).update({
+    health: checks,
+    lastHealthCheckAt: new Date(),
+    status: apiOk ? "connected" : "error",
+    lastError: apiOk ? null : (checks.find((check) => check.key === "api")?.detail ?? null),
+    updatedAt: new Date(),
+  });
   publish(businessId, { type: "whatsapp.updated" });
   return checks;
 }
@@ -475,36 +471,20 @@ export async function syncTemplates(businessId: string) {
     token: credentials.accessToken,
     query: { fields: "id,name,language,status,category,components", limit: "200" },
   });
-  const db = await getDb();
+  const s = await store();
   let count = 0;
   for (const template of data.data ?? []) {
     const body = template.components?.find((c) => c.type === "BODY")?.text ?? "";
     const variableCount = new Set(body.match(/\{\{\d+\}\}/g) ?? []).size;
-    const [existing] = await db
-      .select()
-      .from(whatsappTemplates)
-      .where(
-        and(
-          eq(whatsappTemplates.businessId, businessId),
-          eq(whatsappTemplates.name, template.name),
-          eq(whatsappTemplates.language, template.language),
-        ),
-      );
-    const status = (["APPROVED", "PENDING", "REJECTED", "PAUSED"].includes(template.status) ? template.status : "UNKNOWN") as
-      | "APPROVED"
-      | "PENDING"
-      | "REJECTED"
-      | "PAUSED"
-      | "UNKNOWN";
+    const ref = s.templates(businessId).doc(templateId(template.name, template.language));
+    const existing = fromDoc<WhatsAppTemplate>(await ref.get());
+    const status = (["APPROVED", "PENDING", "REJECTED", "PAUSED"].includes(template.status) ? template.status : "UNKNOWN") as WhatsAppTemplate["status"];
+    const now = new Date();
     if (existing) {
-      await db
-        .update(whatsappTemplates)
-        .set({ status, body, category: template.category, metaTemplateId: template.id })
-        .where(eq(whatsappTemplates.id, existing.id));
+      await ref.update({ status, body, category: template.category, metaTemplateId: template.id, updatedAt: now });
     } else {
       const purpose = PURPOSE_GUESS.find(([pattern]) => pattern.test(template.name))?.[1] ?? "other";
-      await db.insert(whatsappTemplates).values({
-        businessId,
+      await ref.set({
         name: template.name,
         language: template.language,
         category: template.category,
@@ -513,11 +493,18 @@ export async function syncTemplates(businessId: string) {
         purpose,
         variables: defaultVariables(purpose).slice(0, variableCount),
         metaTemplateId: template.id,
+        createdAt: now,
+        updatedAt: now,
       });
     }
     count += 1;
   }
   return count;
+}
+
+/** templates/{name__language}: the Meta template name + language is unique. */
+export function templateId(name: string, language: string) {
+  return `${name}__${language}`.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
 export const TEMPLATE_VARIABLES = ["customer_name", "order_id", "total", "tracking", "business_name", "status"] as const;

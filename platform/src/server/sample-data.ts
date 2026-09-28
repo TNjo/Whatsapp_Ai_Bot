@@ -1,8 +1,8 @@
 import "server-only";
-import { and, eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { businesses, categories, faqs, orderFormFields, productVariants, products, services } from "@/db/schema";
+import { fromDoc, newId, store } from "@/db";
+import type { Business, Product } from "@/db/schema";
 import { audit, type AuditActor } from "./audit";
+import { resolveCategory } from "./admin/categories";
 import { ensureOrderForm } from "./commerce/order-form";
 
 type SampleProduct = {
@@ -80,90 +80,97 @@ function combinations(options: { name: string; values: string[] }[]): Record<str
 
 /** Loads a small clothing-store catalog so the owner can try the bot immediately. */
 export async function loadSampleData(businessId: string, actor: AuditActor) {
-  const db = await getDb();
-  const existing = await db.select({ id: products.id }).from(products).where(eq(products.businessId, businessId)).limit(1);
-  if (existing.length) return { added: false };
+  const s = await store();
+  const existing = await s.products(businessId).limit(1).get();
+  if (!existing.empty) return { added: false };
 
-  await db.transaction(async (tx) => {
-    const categoryIds = new Map<string, string>();
-    for (const name of [...new Set(PRODUCTS.map((p) => p.category))]) {
-      const [row] = await tx.insert(categories).values({ businessId, name, kind: "product" }).onConflictDoNothing().returning();
-      if (row) categoryIds.set(name, row.id);
-    }
-    for (const sample of PRODUCTS) {
-      const combos = combinations(sample.options);
-      const [product] = await tx
-        .insert(products)
-        .values({
-          businessId,
-          categoryId: categoryIds.get(sample.category) ?? null,
-          name: sample.name,
-          description: sample.description,
-          price: sample.price,
-          discountPrice: sample.discountPrice ?? null,
-          sku: sample.sku,
-          options: sample.options,
-          stock: combos.length * sample.stockPerVariant,
-        })
-        .returning();
-      await tx.insert(productVariants).values(
-        combos.map((combo) => ({
-          businessId,
-          productId: product.id,
-          optionValues: combo,
-          stock: sample.stockPerVariant,
-          sku: `${sample.sku}-${Object.values(combo).join("-").toUpperCase()}`,
-        })),
-      );
-    }
-    const [svcCat] = await tx.insert(categories).values({ businessId, name: "Alterations", kind: "service" }).onConflictDoNothing().returning();
-    await tx.insert(services).values({
+  const now = new Date();
+  const batch = s.db.batch();
+  for (const sample of PRODUCTS) {
+    const combos = combinations(sample.options);
+    const categoryId = await resolveCategory(businessId, "product", sample.category);
+    const product: Omit<Product, "id"> = {
       businessId,
-      categoryId: svcCat?.id ?? null,
-      name: "Trouser Hemming",
-      description: "Hem any trousers or jeans to your length.",
-      price: 80000,
-      durationMinutes: 45,
-      availability: "Mon–Sat, 10 AM – 6 PM",
-    });
-    await tx.insert(faqs).values([
-      { businessId, question: "Do you deliver islandwide?", answer: "Yes, we deliver throughout Sri Lanka within 2–4 working days.", sortOrder: 0 },
-      { businessId, question: "Can I exchange a size?", answer: "Yes, unworn items can be exchanged within 7 days with the receipt.", sortOrder: 1 },
-    ]);
-    // Only fill profile fields the owner hasn't written yet.
-    const [current] = await tx.select().from(businesses).where(eq(businesses.id, businessId));
-    const defaults = {
-      description: "A clothing store selling men's and women's fashion products in Sri Lanka.",
-      openingHours: "Monday–Friday: 9 AM – 7 PM\nSaturday: 9 AM – 2 PM",
-      deliveryInfo: "Islandwide delivery in 2–4 working days.",
-      returnPolicy: "Returns accepted within 7 days for unworn items with tags.",
-      exchangePolicy: "Size exchanges within 7 days.",
-    } as const;
-    const fill: Partial<typeof businesses.$inferInsert> = {};
-    for (const [key, value] of Object.entries(defaults) as [keyof typeof defaults, string][]) {
-      if (!current[key]?.trim()) fill[key] = value;
-    }
-    if (!current.deliveryFee) fill.deliveryFee = 35000;
-    if (Object.keys(fill).length) await tx.update(businesses).set(fill).where(eq(businesses.id, businessId));
-
-    const form = await ensureOrderForm(businessId, tx);
-    const [existingField] = await tx
-      .select()
-      .from(orderFormFields)
-      .where(and(eq(orderFormFields.formId, form.id), eq(orderFormFields.key, "delivery_time")));
-    if (!existingField) {
-      await tx.insert(orderFormFields).values({
-        businessId,
-        formId: form.id,
-        key: "delivery_time",
-        label: "Preferred delivery time",
-        type: "select",
-        required: false,
-        options: ["Morning", "Afternoon", "Evening"],
-        sortOrder: 20,
-      });
-    }
+      categoryId,
+      name: sample.name,
+      description: sample.description,
+      price: sample.price,
+      discountPrice: sample.discountPrice ?? null,
+      sku: sample.sku,
+      stock: combos.length * sample.stockPerVariant,
+      trackStock: true,
+      images: [],
+      options: sample.options,
+      variants: combos.map((combo) => ({
+        id: newId(),
+        optionValues: combo,
+        price: null,
+        stock: sample.stockPerVariant,
+        sku: `${sample.sku}-${Object.values(combo).join("-").toUpperCase()}`,
+        active: true,
+      })),
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    };
+    batch.set(s.products(businessId).doc(newId()), product);
+  }
+  const serviceCategory = await resolveCategory(businessId, "service", "Alterations");
+  batch.set(s.services(businessId).doc(newId()), {
+    businessId,
+    categoryId: serviceCategory,
+    name: "Trouser Hemming",
+    description: "Hem any trousers or jeans to your length.",
+    price: 80000,
+    durationMinutes: 45,
+    availability: "Mon–Sat, 10 AM – 6 PM",
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
   });
+  [
+    { question: "Do you deliver islandwide?", answer: "Yes, we deliver throughout Sri Lanka within 2–4 working days." },
+    { question: "Can I exchange a size?", answer: "Yes, unworn items can be exchanged within 7 days with the receipt." },
+  ].forEach((faq, sortOrder) => batch.set(s.faqs(businessId).doc(newId()), { ...faq, enabled: true, sortOrder, createdAt: now, updatedAt: now }));
+
+  // Only fill profile fields the owner hasn't written yet.
+  const current = fromDoc<Business>(await s.businesses.doc(businessId).get())!;
+  const defaults = {
+    description: "A clothing store selling men's and women's fashion products in Sri Lanka.",
+    openingHours: "Monday–Friday: 9 AM – 7 PM\nSaturday: 9 AM – 2 PM",
+    deliveryInfo: "Islandwide delivery in 2–4 working days.",
+    returnPolicy: "Returns accepted within 7 days for unworn items with tags.",
+    exchangePolicy: "Size exchanges within 7 days.",
+  } as const;
+  const fill: Partial<Business> = {};
+  for (const [key, value] of Object.entries(defaults) as [keyof typeof defaults, string][]) {
+    if (!current[key]?.trim()) fill[key] = value;
+  }
+  if (!current.deliveryFee) fill.deliveryFee = 35000;
+  if (Object.keys(fill).length) batch.update(s.businesses.doc(businessId), { ...fill, updatedAt: now });
+
+  const form = await ensureOrderForm(businessId);
+  if (!form.fields.some((field) => field.key === "delivery_time")) {
+    batch.update(s.orderForm(businessId), {
+      fields: [
+        ...form.fields,
+        {
+          id: newId(),
+          key: "delivery_time",
+          label: "Preferred delivery time",
+          type: "select",
+          required: false,
+          enabled: true,
+          system: false,
+          options: ["Morning", "Afternoon", "Evening"],
+          helpText: "",
+          sortOrder: form.fields.length,
+        },
+      ],
+      updatedAt: now,
+    });
+  }
+  await batch.commit();
   await audit(businessId, actor, "business.sample_data_loaded", { type: "business", id: businessId });
   return { added: true };
 }

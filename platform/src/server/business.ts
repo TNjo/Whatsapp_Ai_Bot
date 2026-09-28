@@ -1,40 +1,47 @@
 import "server-only";
-import { eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { businessMembers, businesses, users } from "@/db/schema";
+import { fromDoc, fromDocs, newId, store } from "@/db";
+import { BUSINESS_DEFAULTS, type Membership, type User } from "@/db/schema";
 import { audit } from "./audit";
+import { membershipId } from "./auth";
 import { ensureBotSettings } from "./bot/settings";
 import { ensureOrderForm } from "./commerce/order-form";
 import { hashPassword, verifyPassword } from "./crypto";
 import { ApiError } from "./http";
 
 export async function registerBusiness(input: { businessName: string; name: string; email: string; password: string }) {
-  const db = await getDb();
+  const s = await store();
   const email = input.email.trim().toLowerCase();
-  const [taken] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
-  if (taken) throw new ApiError(409, "An account with this email already exists. Sign in instead.");
   const passwordHash = await hashPassword(input.password);
+  const userId = newId();
+  const businessId = newId();
+  const now = new Date();
+  const user: User = { id: userId, email, name: input.name.trim(), passwordHash, createdAt: now, updatedAt: now };
 
-  const result = await db.transaction(async (tx) => {
-    const [user] = await tx.insert(users).values({ email, name: input.name.trim(), passwordHash }).returning();
-    const [business] = await tx.insert(businesses).values({ name: input.businessName.trim() }).returning();
-    await tx.insert(businessMembers).values({ businessId: business.id, userId: user.id, role: "owner" });
-    await ensureBotSettings(business.id, tx);
-    await ensureOrderForm(business.id, tx);
-    return { user, business };
+  await s.db.runTransaction(async (tx) => {
+    const taken = await tx.get(s.userEmails.doc(email));
+    if (taken.exists) throw new ApiError(409, "An account with this email already exists. Sign in instead.");
+    tx.create(s.userEmails.doc(email), { userId });
+    tx.create(s.users.doc(userId), { email, name: user.name, passwordHash, createdAt: now, updatedAt: now });
+    tx.create(s.businesses.doc(businessId), { ...BUSINESS_DEFAULTS, name: input.businessName.trim(), createdAt: now, updatedAt: now });
+    tx.create(s.memberships.doc(membershipId(businessId, userId)), { businessId, userId, role: "owner", createdAt: now });
   });
-  await audit(result.business.id, { userId: result.user.id, name: result.user.name }, "business.registered", { type: "business", id: result.business.id });
-  return result;
+  await ensureBotSettings(businessId);
+  await ensureOrderForm(businessId);
+  await audit(businessId, { userId, name: user.name }, "business.registered", { type: "business", id: businessId });
+  return { user, business: { id: businessId, name: input.businessName.trim() } };
 }
 
-/** Constant-time-ish login: always runs a hash comparison, even for unknown emails. */
+const DUMMY_HASH = "scrypt$AAAAAAAAAAAAAAAAAAAAAA==$" + "A".repeat(86) + "==";
+
+/** Always runs a hash comparison, even for unknown emails, so timing doesn't reveal accounts. */
 export async function authenticate(emailRaw: string, password: string) {
-  const db = await getDb();
+  const s = await store();
   const email = emailRaw.trim().toLowerCase();
-  const [user] = await db.select().from(users).where(eq(users.email, email));
-  const ok = await verifyPassword(password, user?.passwordHash ?? "scrypt$AAAAAAAAAAAAAAAAAAAAAA==$" + "A".repeat(86) + "==");
+  const index = (await s.userEmails.doc(email).get()).data() as { userId?: string } | undefined;
+  const user = index?.userId ? fromDoc<User>(await s.users.doc(index.userId).get()) : null;
+  const ok = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH);
   if (!user || !ok) throw new ApiError(401, "Email or password is incorrect.");
-  const [membership] = await db.select().from(businessMembers).where(eq(businessMembers.userId, user.id)).limit(1);
+  const [membership] = fromDocs<Membership>(await s.memberships.where("userId", "==", user.id).limit(1).get());
   if (!membership) throw new ApiError(403, "This account is not part of a business.");
   return { user, businessId: membership.businessId };
 }

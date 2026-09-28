@@ -1,8 +1,7 @@
 import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, desc, eq } from "drizzle-orm";
-import { closeDb, getDb } from "@/db";
-import { conversations, customers, messages, notifications, orders, orderStatusHistory, whatsappTemplates } from "@/db/schema";
+import { closeDb, fromDoc, fromDocs, store } from "@/db";
+import type { Cart, Conversation, Customer, Message, Notification, NotificationType, Order } from "@/db/schema";
 import { setMockAIHandler } from "@/server/ai/service";
 import { orderDetail } from "@/server/admin/orders";
 import { registerBusiness } from "@/server/business";
@@ -67,6 +66,20 @@ async function customerSends(waId: string, input: string | { replyId: string; ti
 
 const lastSent = () => sentText(graph.sent().at(-1)!);
 
+/** Firestore lookups for assertions. Customer and conversation ids equal the WhatsApp id. */
+const data = {
+  customer: async (waId: string) => fromDoc<Customer>(await (await store()).customers(businessId).doc(waId).get()),
+  conversation: async (waId: string) => fromDoc<Conversation>(await (await store()).conversations(businessId).doc(waId).get()),
+  orders: async () => fromDocs<Order>(await (await store()).orders(businessId).get()),
+  ordersOf: async (waId: string) => (await data.orders()).filter((o) => o.customerId === waId),
+  notifications: async (type: NotificationType) =>
+    fromDocs<Notification>(await (await store()).notifications(businessId).get()).filter((n) => n.type === type),
+  messages: async () =>
+    fromDocs<Message>(await (await store()).db.collectionGroup("messages").where("businessId", "==", businessId).get()).sort(
+      (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+    ),
+};
+
 beforeAll(async () => {
   graph = await startMockGraph({ appId: process.env.META_APP_ID!, callbackUrl: `${process.env.APP_URL}/api/webhooks/whatsapp` });
   process.env.WHATSAPP_GRAPH_BASE_URL = graph.baseUrl;
@@ -102,9 +115,9 @@ describe("WhatsApp connection", () => {
   });
 
   it("never stores the access token in plain text", async () => {
-    const db = await getDb();
-    const rows = await db.execute("select access_token_enc from whatsapp_connections");
-    expect(JSON.stringify(rows)).not.toContain("EAAtesttoken");
+    const raw = (await (await store()).whatsapp(businessId).get()).data();
+    expect(raw?.accessTokenEnc).toMatch(/^v1\./);
+    expect(JSON.stringify(raw)).not.toContain("EAAtesttoken");
   });
 });
 
@@ -115,8 +128,7 @@ describe("acceptance scenario (spec §61)", () => {
   it("welcomes a new customer", async () => {
     await customerSends(kasun, "Hi");
     expect(lastSent()).toContain("Welcome to UrbanStyle");
-    const db = await getDb();
-    const [customer] = await db.select().from(customers).where(and(eq(customers.businessId, businessId), eq(customers.waId, kasun)));
+    const customer = (await data.customer(kasun))!;
     expect(customer.profileName).toBe("Kasun Perera");
     expect(customer.phone).toBe("+94771234567");
   });
@@ -154,16 +166,14 @@ describe("acceptance scenario (spec §61)", () => {
     const buttons = (review.interactive as { action: { buttons: { reply: { id: string } }[] } }).action.buttons.map((b) => b.reply.id);
     expect(buttons).toEqual(["confirm_order", "edit_order", "cancel_order"]);
 
-    const db = await getDb();
-    expect(await db.select().from(orders).where(eq(orders.businessId, businessId))).toHaveLength(0); // still a draft
+    expect(await data.orders()).toHaveLength(0); // still a draft
   });
 
   it("creates a PENDING order only when the customer confirms, and notifies the dashboard", async () => {
     await customerSends(kasun, { replyId: "confirm_order", title: "Confirm Order" });
     expect(lastSent()).toMatch(/Your order \*#ORD-10001\* has been placed/);
 
-    const db = await getDb();
-    const [order] = await db.select().from(orders).where(eq(orders.businessId, businessId));
+    const [order] = await data.orders();
     orderId = order.id;
     expect(order).toMatchObject({
       orderNumber: "ORD-10001",
@@ -175,7 +185,7 @@ describe("acceptance scenario (spec §61)", () => {
       customerPhone: "+94771234567",
     });
     expect(events.some((e) => e.type === "order.created" && e.orderNumber === "ORD-10001")).toBe(true);
-    const [notification] = await db.select().from(notifications).where(and(eq(notifications.businessId, businessId), eq(notifications.type, "new_order")));
+    const [notification] = await data.notifications("new_order");
     expect(notification.title).toBe("New order ORD-10001");
 
     const detail = await orderDetail(businessId, orderId);
@@ -265,20 +275,14 @@ describe("webhook safety", () => {
     const before = graph.sent().length;
     await processWebhook(payload);
     await processWebhook(payload);
-    const db = await getDb();
-    const stored = await db.select().from(messages).where(eq(messages.waMessageId, "wamid.DUPLICATE"));
+    const stored = (await data.messages()).filter((m) => m.waMessageId === "wamid.DUPLICATE");
     expect(stored).toHaveLength(1);
     expect(graph.sent().length - before).toBe(1); // one reply, not two
   });
 
   it("tracks delivered / read / failed statuses on sent messages", async () => {
-    const db = await getDb();
-    const [outbound] = await db
-      .select()
-      .from(messages)
-      .where(and(eq(messages.businessId, businessId), eq(messages.direction, "outbound")))
-      .orderBy(desc(messages.createdAt))
-      .limit(1);
+    const outbound = (await data.messages()).filter((m) => m.direction === "outbound").at(-1)!;
+    const reread = async () => (await data.messages()).find((m) => m.id === outbound.id)!;
     const statusPayload = (status: string, errors?: unknown[]): WebhookPayload => ({
       object: "whatsapp_business_account",
       entry: [{ changes: [{ field: "messages", value: { metadata: { phone_number_id: PHONE_NUMBER_ID }, statuses: [{ id: outbound.waMessageId!, status, errors } as never] } }] }],
@@ -286,22 +290,21 @@ describe("webhook safety", () => {
     await processWebhook(statusPayload("delivered"));
     await processWebhook(statusPayload("read"));
     await processWebhook(statusPayload("delivered")); // out of order: must not downgrade
-    let [row] = await db.select().from(messages).where(eq(messages.id, outbound.id));
+    let row = await reread();
     expect(row.status).toBe("read");
     await processWebhook(statusPayload("failed", [{ code: 131026, message: "Undeliverable" }]));
-    [row] = await db.select().from(messages).where(eq(messages.id, outbound.id));
+    row = await reread();
     expect(row.status).toBe("failed");
     expect(row.errorMessage).toMatch(/could not be delivered/);
   });
 
   it("ignores messages for phone numbers that aren't connected", async () => {
-    const db = await getDb();
-    const before = (await db.select().from(messages)).length;
+    const before = (await data.messages()).length;
     await processWebhook({
       object: "whatsapp_business_account",
       entry: [{ changes: [{ field: "messages", value: { metadata: { phone_number_id: "999" }, messages: [{ id: "wamid.X", from: "1", type: "text", text: { body: "hi" } }] } }] }],
     });
-    expect((await db.select().from(messages)).length).toBe(before);
+    expect((await data.messages()).length).toBe(before);
   });
 });
 
@@ -311,13 +314,7 @@ describe("order rules", () => {
     await customerSends(waId, "I want 1 premium black t-shirt in medium", "Amaya");
     await customerSends(waId, "confirm");
     expect(lastSent()).toMatch(/Sorry/);
-    const db = await getDb();
-    const customerOrders = await db
-      .select()
-      .from(orders)
-      .innerJoin(customers, eq(customers.id, orders.customerId))
-      .where(eq(customers.waId, waId));
-    expect(customerOrders).toHaveLength(0);
+    expect(await data.ordersOf(waId)).toHaveLength(0);
   });
 
   it("drops a stale review when the order changes after it was shown", async () => {
@@ -327,23 +324,16 @@ describe("order rules", () => {
     await customerSends(waId, "Cash on delivery");
     expect(sentText(graph.sent().at(-1)!)).toContain("Total: Rs. 2,850");
     // The draft changes after the review was shown (no new review sent), then the old Confirm button is tapped.
-    const db = await getDb();
-    const { cartItems, carts } = await import("@/db/schema");
-    const [cart] = await db
-      .select({ id: carts.id })
-      .from(carts)
-      .innerJoin(customers, eq(customers.id, carts.customerId))
-      .where(and(eq(customers.waId, waId), eq(carts.status, "open")));
-    await db.update(cartItems).set({ quantity: 3 }).where(eq(cartItems.cartId, cart.id));
+    const cartRef = (await store()).carts(businessId).doc(waId);
+    const cart = fromDoc<Cart>(await cartRef.get())!;
+    await cartRef.update({ items: cart.items.map((item) => ({ ...item, quantity: 3 })) });
     await customerSends(waId, { replyId: "confirm_order", title: "Confirm Order" }, "Ruwan");
     expect(lastSent()).toContain("Your order was updated — please check the new summary.");
     expect(lastSent()).toContain("Total: Rs. 7,850");
-    const db2 = await getDb();
-    expect(await db2.select().from(orders).innerJoin(customers, eq(customers.id, orders.customerId)).where(eq(customers.waId, waId))).toHaveLength(0);
+    expect(await data.ordersOf(waId)).toHaveLength(0);
     // Confirming the refreshed summary places the order with the new quantity.
     await customerSends(waId, { replyId: "confirm_order", title: "Confirm Order" }, "Ruwan");
-    const rows = await db.select({ order: orders }).from(orders).innerJoin(customers, eq(customers.id, orders.customerId)).where(eq(customers.waId, waId));
-    expect(rows.map((r) => r.order.total)).toEqual([785000]);
+    expect((await data.ordersOf(waId)).map((o) => o.total)).toEqual([785000]);
   });
 });
 
@@ -357,12 +347,10 @@ describe("human handoff", () => {
     setMockAIHandler(scriptedAI);
     expect(lastSent()).toContain("I'm having trouble processing your request right now.");
 
-    const db = await getDb();
-    const [customer] = await db.select().from(customers).where(and(eq(customers.businessId, businessId), eq(customers.waId, waId)));
-    const [conversation] = await db.select().from(conversations).where(eq(conversations.customerId, customer.id));
+    const conversation = (await data.conversation(waId))!;
     expect(conversation.status).toBe("human_required");
     expect(conversation.aiEnabled).toBe(false);
-    const alerts = await db.select().from(notifications).where(and(eq(notifications.businessId, businessId), eq(notifications.type, "human_support")));
+    const alerts = await data.notifications("human_support");
     expect(alerts.length).toBeGreaterThan(0);
 
     const before = graph.sent().length;
@@ -383,30 +371,28 @@ describe("24-hour customer service window", () => {
     await customerSends(waId, "old customer, 1 temple road, colombo 03");
     await customerSends(waId, "Cash on delivery");
     await customerSends(waId, { replyId: "confirm_order", title: "Confirm Order" }, "Old Customer");
-    const db = await getDb();
-    const [row] = await db
-      .select({ order: orders })
-      .from(orders)
-      .innerJoin(customers, eq(customers.id, orders.customerId))
-      .where(eq(customers.waId, waId));
-    const order = row.order;
+    const [order] = await data.ordersOf(waId);
+    const s = await store();
 
     // Pretend the customer last wrote two days ago.
-    await db.update(conversations).set({ lastInboundAt: new Date(Date.now() - 2 * 86400000) }).where(eq(conversations.id, order.conversationId!));
+    await s.conversations(businessId).doc(order.conversationId!).update({ lastInboundAt: new Date(Date.now() - 2 * 86400000) });
 
     const noTemplate = await changeOrderStatus(businessId, order.id, "CONFIRMED", OWNER);
     expect(noTemplate.notification.notification).toBe("failed");
-    const warn = await db.select().from(notifications).where(and(eq(notifications.businessId, businessId), eq(notifications.type, "message_failed")));
+    const warn = await data.notifications("message_failed");
     expect(warn.some((n) => n.title.includes(order.orderNumber))).toBe(true);
 
-    await db.insert(whatsappTemplates).values({
-      businessId,
+    await s.templates(businessId).doc("order_update_processing__en").set({
       name: "order_update_processing",
       language: "en",
+      category: "UTILITY",
       purpose: "order_processing",
       status: "APPROVED",
       body: "Hi {{1}}, order {{2}} is being prepared.",
       variables: ["customer_name", "order_id"],
+      metaTemplateId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
     });
     const viaTemplate = await changeOrderStatus(businessId, order.id, "PROCESSING", OWNER);
     expect(viaTemplate.notification.notification).toBe("template");
@@ -414,7 +400,7 @@ describe("24-hour customer service window", () => {
     expect(sent.type).toBe("template");
     expect(sentText(sent)).toBe(`[template order_update_processing] Old | ${order.orderNumber}`);
 
-    const history = await db.select().from(orderStatusHistory).where(eq(orderStatusHistory.orderId, order.id));
+    const { history } = await orderDetail(businessId, order.id);
     expect(history.map((h) => h.notification)).toEqual(["skipped", "failed", "template"]);
   });
 });
@@ -422,8 +408,7 @@ describe("24-hour customer service window", () => {
 describe("tenant isolation", () => {
   it("never lets another business read orders or conversations", async () => {
     const { business: other } = await registerBusiness({ businessName: "Other Shop", name: "Eve", email: "eve@other.test", password: "password123" });
-    const db = await getDb();
-    const [order] = await db.select().from(orders).where(eq(orders.businessId, businessId)).limit(1);
+    const [order] = await data.orders();
     await expect(orderDetail(other.id, order.id)).rejects.toThrow("Order not found");
     await expect(loadConversation(other.id, order.conversationId!)).rejects.toThrow("Conversation not found");
     await expect(changeOrderStatus(other.id, order.id, "CANCELLED", OWNER)).rejects.toThrow("Order not found");
@@ -452,15 +437,120 @@ describe("sending failures", () => {
   it("marks the message failed and alerts the owner when WhatsApp refuses it", async () => {
     graph.failNextSend(131026, "Message undeliverable");
     await customerSends("94770000008", "Do you have hoodies?", "Unreachable");
-    const db = await getDb();
-    const [failed] = await db
-      .select()
-      .from(messages)
-      .where(and(eq(messages.businessId, businessId), eq(messages.status, "failed")))
-      .orderBy(desc(messages.createdAt))
-      .limit(1);
+    const failed = (await data.messages()).filter((m) => m.status === "failed").at(-1)!;
     expect(failed.errorMessage).toMatch(/could not be delivered/);
-    const alerts = await db.select().from(notifications).where(and(eq(notifications.businessId, businessId), eq(notifications.type, "message_failed")));
+    const alerts = await data.notifications("message_failed");
     expect(alerts.some((a) => a.title.includes("Unreachable"))).toBe(true);
   });
 });
+
+describe("dashboard reads (every query must have its Firestore index declared)", () => {
+  it("serves the orders, inbox, customers, catalog, dashboard, WhatsApp and settings pages", async () => {
+    const { listOrders, statusCounts } = await import("@/server/admin/orders");
+    const { listConversations, conversationDetail, conversationMessages } = await import("@/server/admin/inbox");
+    const { dashboardData } = await import("@/server/admin/dashboard");
+    const { whatsappOverview, listTemplates, statusMessagesView } = await import("@/server/admin/whatsapp");
+    const { shellCounts, listNotifications } = await import("@/server/queries/shell");
+    const { listCustomers, getCustomer } = await import("@/server/admin/customers");
+    const { listProducts } = await import("@/server/admin/products");
+    const { listServices } = await import("@/server/admin/services");
+    const { getBusinessProfile, listMembers, listAuditLogs } = await import("@/server/admin/business-settings");
+    const { getBotSettingsView, listKnowledge, getBusinessFacts, getOrderFormView } = await import("@/server/admin/bot");
+
+    for (const status of ["PENDING", "OPEN", "COMPLETED", "ALL", "CONFIRMED"] as const) {
+      await listOrders(businessId, { status });
+      await listOrders(businessId, { status, includeTest: true });
+      await listOrders(businessId, { status, q: "kasun" });
+    }
+    const all = await listOrders(businessId, { status: "ALL" });
+    expect(all.total).toBeGreaterThanOrEqual(3);
+    expect(all.orders[0].customer.phone).toMatch(/^\+94/);
+    expect((await listOrders(businessId, { status: "ALL", q: "ORD-10001" })).orders.map((o) => o.orderNumber)).toEqual(["ORD-10001"]);
+    expect((await statusCounts(businessId)).COMPLETED).toBe(1);
+    await statusCounts(businessId, true);
+
+    for (const filter of ["all", "human", "unread", "active", "resolved"] as const) await listConversations(businessId, { filter });
+    const inbox = await listConversations(businessId, { q: "771234567" });
+    expect(inbox.map((c) => c.displayName)).toEqual(["Kasun Perera"]);
+    const detail = await conversationDetail(businessId, inbox[0].id);
+    expect(detail.messages.length).toBeGreaterThan(5);
+    await conversationMessages(businessId, inbox[0].id, new Date());
+
+    const dash = await dashboardData(businessId, "Asia/Colombo");
+    expect(dash.stats.completed).toBe(1);
+    expect(dash.stats.customers).toBeGreaterThan(3);
+    expect(dash.handoffs.length).toBeGreaterThan(0);
+
+    const overview = await whatsappOverview(businessId);
+    expect(overview.stats.messages).toBeGreaterThan(10);
+    await listTemplates(businessId);
+    await statusMessagesView(businessId);
+    const counts = await shellCounts(businessId);
+    expect(counts.humanRequired).toBeGreaterThan(0);
+    await listNotifications(businessId);
+
+    const customers = await listCustomers(businessId, { query: "771234567" });
+    expect(customers.customers.length).toBe(1);
+    await getCustomer(businessId, customers.customers[0].id);
+    expect((await listProducts(businessId)).length).toBe(5);
+    await listProducts(businessId, { status: "out_of_stock" });
+    await listServices(businessId);
+    await getBusinessProfile(businessId);
+    await listMembers(businessId);
+    expect((await listAuditLogs(businessId)).length).toBeGreaterThan(0);
+    await getBotSettingsView(businessId);
+    await listKnowledge(businessId);
+    await getBusinessFacts(businessId);
+    await getOrderFormView(businessId);
+  });
+});
+
+describe("dashboard writes (Firestore transactions read before they write)", () => {
+  it("edits products, stock, customers, team, FAQs, notes, bot settings and the order form", async () => {
+    const products = await import("@/server/admin/products");
+    const { updateCustomer } = await import("@/server/admin/customers");
+    const settings = await import("@/server/admin/business-settings");
+    const bot = await import("@/server/admin/bot");
+
+    const created = await products.createProduct(
+      businessId,
+      products.ProductInput.parse({ name: "Linen Shirt", price: "4200", options: [{ name: "Size", values: ["M", "L"] }], variants: [] }),
+      OWNER,
+    );
+    const detail = (await products.getProductDetail(businessId, created.id))!;
+    const updated = await products.updateProduct(businessId, created.id, { options: [{ name: "Size", values: ["M", "L", "XL"] }] }, OWNER);
+    expect(updated.variants.length).toBe(3);
+    expect(updated.variants.filter((v) => detail.variants.some((d) => d.id === v.id)).length).toBe(2); // ids kept
+    await products.setProductStock(businessId, created.id, { variants: updated.variants.map((v) => ({ id: v.id, stock: 4 })) }, OWNER);
+    expect((await products.getProductDetail(businessId, created.id))!.stock).toBe(12);
+    await products.deleteProduct(businessId, created.id, OWNER);
+
+    await updateCustomer(businessId, "94771234567", { notes: "VIP" }, OWNER);
+    expect((await data.customer("94771234567"))?.notes).toBe("VIP");
+
+    await settings.updateBusinessProfile(businessId, { openingHours: "9–5" }, OWNER);
+    const staff = await settings.addStaffMember(businessId, { name: "Nimal", email: "nimal@shop.test", password: "password123" }, OWNER);
+    expect((await settings.listMembers(businessId)).length).toBe(2);
+    await settings.removeMember(businessId, staff.id, OWNER);
+    expect((await settings.listMembers(businessId)).length).toBe(1);
+
+    const faq = await bot.createFaq(businessId, { question: "Gift wrap?", answer: "Yes, free.", enabled: true }, OWNER);
+    await bot.updateFaq(businessId, faq.id, { move: "up" }, OWNER);
+    await bot.deleteFaq(businessId, faq.id, OWNER);
+    const note = await bot.createNote(businessId, { title: "Sizes", content: "Runs small.", enabled: true }, OWNER);
+    await bot.updateNote(businessId, note.id, { content: "Runs one size small." }, OWNER);
+    await bot.deleteNote(businessId, note.id, OWNER);
+    await bot.updateBotSettings(businessId, { botName: "UrbanStyle Assistant" }, OWNER);
+
+    const form = await bot.getOrderFormView(businessId);
+    await bot.replaceOrderForm(
+      businessId,
+      bot.OrderFormInput.parse({
+        fields: [...form.fields, { key: "gift_note", label: "Gift note", type: "textarea", required: false, enabled: true, options: [], helpText: "" }],
+      }),
+      OWNER,
+    );
+    expect((await bot.getOrderFormView(businessId)).fields.some((f) => f.key === "gift_note")).toBe(true);
+  });
+});
+

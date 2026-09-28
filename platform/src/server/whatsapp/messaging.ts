@@ -211,9 +211,9 @@ export class WhatsAppMessagingService {
 
 export const UPLOAD_ROOT = path.join(process.cwd(), ".data", "uploads");
 
-/** Maps "/api/uploads/<business>/<file>" to a file inside the upload root, rejecting traversal. */
+/** Maps "/api/uploads/<businessId>/<file>" to a file inside the upload root, rejecting traversal. */
 export function localUploadPath(url: string): string | null {
-  const match = /^\/api\/uploads\/([0-9a-f-]{36})\/([A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp|pdf))$/.exec(url);
+  const match = /^\/api\/uploads\/([A-Za-z0-9_-]{8,64})\/([A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp|pdf))$/.exec(url);
   if (!match) return null;
   const resolved = path.resolve(UPLOAD_ROOT, match[1], match[2]);
   return resolved.startsWith(UPLOAD_ROOT + path.sep) ? resolved : null;

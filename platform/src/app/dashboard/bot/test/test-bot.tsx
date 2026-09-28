@@ -54,6 +54,7 @@ export function TestBot({
     if (pending) return;
     const optimistic: ChatMessage = {
       id: "pending",
+      conversationId: chat.conversation.id,
       direction: "inbound",
       sender: "customer",
       type: body.replyId ? "interactive" : "text",

@@ -1,104 +1,114 @@
 import "server-only";
-import { and, asc, count, desc, eq, ilike, inArray, or, type SQL } from "drizzle-orm";
-import { getDb } from "@/db";
-import { conversations, customers, messages, orderCustomFields, orderItems, orders, orderStatusHistory } from "@/db/schema";
-import { ORDER_STATUSES, type OrderStatus } from "@/lib/order-status";
+import type { Query } from "firebase-admin/firestore";
+import { fromDoc, fromDocs, store } from "@/db";
+import type { Conversation, Customer, Message, Order } from "@/db/schema";
+import { OPEN_STATUSES, ORDER_STATUSES, type OrderStatus } from "@/lib/order-status";
 import { audit, type AuditActor } from "../audit";
-import { notFound } from "../http";
+import { customerOrders } from "../commerce/orders";
 import { publish } from "../events";
+import { notFound } from "../http";
 
 export type OrderFilter = { status?: OrderStatus | "ALL" | "OPEN"; q?: string; page?: number; limit?: number; includeTest?: boolean };
 
+const SEARCH_WINDOW = 500;
+
+function filtered(base: Query, filter: OrderFilter) {
+  let query = base;
+  if (!filter.includeTest) query = query.where("isTest", "==", false);
+  if (filter.status === "OPEN") query = query.where("status", "in", OPEN_STATUSES.filter((s) => s !== "PENDING"));
+  else if (filter.status && filter.status !== "ALL") query = query.where("status", "==", filter.status);
+  return query;
+}
+
+/**
+ * Newest first, paginated in Firestore. Text search (order number, name, phone)
+ * scans the most recent orders in memory — Firestore has no substring search.
+ */
 export async function listOrders(businessId: string, filter: OrderFilter = {}) {
-  const db = await getDb();
+  const s = await store();
   const limit = filter.limit ?? 25;
   const page = Math.max(1, filter.page ?? 1);
-  const where: SQL[] = [eq(orders.businessId, businessId)];
-  if (!filter.includeTest) where.push(eq(orders.isTest, false));
-  if (filter.status === "OPEN") where.push(inArray(orders.status, ["CONFIRMED", "PROCESSING", "READY", "DISPATCHED"]));
-  else if (filter.status && filter.status !== "ALL") where.push(eq(orders.status, filter.status));
-  const q = filter.q?.trim();
-  if (q) {
-    where.push(
-      or(ilike(orders.orderNumber, `%${q}%`), ilike(orders.customerName, `%${q}%`), ilike(orders.customerPhone, `%${q}%`), ilike(customers.phone, `%${q}%`))!,
-    );
-  }
-  const condition = and(...where);
-  const rows = await db
-    .select({ order: orders, customer: { id: customers.id, displayName: customers.displayName, profileName: customers.profileName, phone: customers.phone } })
-    .from(orders)
-    .innerJoin(customers, eq(customers.id, orders.customerId))
-    .where(condition)
-    .orderBy(desc(orders.createdAt))
-    .limit(limit)
-    .offset((page - 1) * limit);
-  const [{ total }] = await db.select({ total: count() }).from(orders).innerJoin(customers, eq(customers.id, orders.customerId)).where(condition);
+  const query = filtered(s.orders(businessId), filter);
+  const q = filter.q?.trim().toLowerCase();
 
-  const ids = rows.map((row) => row.order.id);
-  const items = ids.length
-    ? await db
-        .select({ orderId: orderItems.orderId, name: orderItems.name, quantity: orderItems.quantity })
-        .from(orderItems)
-        .where(inArray(orderItems.orderId, ids))
-    : [];
+  let rows: Order[];
+  let total: number;
+  if (q) {
+    const recent = fromDocs<Order>(await query.orderBy("createdAt", "desc").limit(SEARCH_WINDOW).get());
+    const matches = recent.filter((o) => `${o.orderNumber} ${o.customerName} ${o.customerPhone}`.toLowerCase().includes(q));
+    total = matches.length;
+    rows = matches.slice((page - 1) * limit, page * limit);
+  } else {
+    const [countSnap, pageSnap] = await Promise.all([
+      query.count().get(),
+      query.orderBy("createdAt", "desc").offset((page - 1) * limit).limit(limit).get(),
+    ]);
+    total = countSnap.data().count;
+    rows = fromDocs<Order>(pageSnap);
+  }
+
+  const customerIds = [...new Set(rows.map((o) => o.customerId))];
+  const customers = customerIds.length ? await s.db.getAll(...customerIds.map((id) => s.customers(businessId).doc(id))) : [];
+  const byId = new Map(customers.map((snap) => [snap.id, fromDoc<Customer>(snap)]));
   return {
     total,
     page,
     limit,
-    orders: rows.map(({ order, customer }) => ({
-      ...order,
-      customer,
-      items: items.filter((item) => item.orderId === order.id).map(({ name, quantity }) => ({ name, quantity })),
-    })),
+    orders: rows.map((order) => {
+      const customer = byId.get(order.customerId);
+      return {
+        ...order,
+        customer: { id: order.customerId, displayName: customer?.displayName ?? "", profileName: customer?.profileName ?? "", phone: customer?.phone ?? "" },
+        items: order.items.map(({ name, quantity }) => ({ name, quantity })),
+      };
+    }),
   };
 }
 
 export async function statusCounts(businessId: string, includeTest = false) {
-  const db = await getDb();
-  const rows = await db
-    .select({ status: orders.status, n: count() })
-    .from(orders)
-    .where(and(eq(orders.businessId, businessId), includeTest ? undefined : eq(orders.isTest, false)))
-    .groupBy(orders.status);
-  const counts = Object.fromEntries(ORDER_STATUSES.map((s) => [s, 0])) as Record<OrderStatus, number>;
-  for (const row of rows) counts[row.status] = row.n;
-  return counts;
+  const s = await store();
+  const entries = await Promise.all(
+    ORDER_STATUSES.map(async (status) => {
+      let query = s.orders(businessId).where("status", "==", status);
+      if (!includeTest) query = query.where("isTest", "==", false);
+      return [status, (await query.count().get()).data().count] as const;
+    }),
+  );
+  return Object.fromEntries(entries) as Record<OrderStatus, number>;
 }
 
 export async function orderDetail(businessId: string, orderId: string) {
-  const db = await getDb();
-  const [row] = await db
-    .select({ order: orders, customer: customers })
-    .from(orders)
-    .innerJoin(customers, eq(customers.id, orders.customerId))
-    .where(and(eq(orders.id, orderId), eq(orders.businessId, businessId)));
-  if (!row) throw notFound("Order not found");
-  const [items, customFields, history, otherOrders] = await Promise.all([
-    db.select().from(orderItems).where(eq(orderItems.orderId, orderId)),
-    db.select().from(orderCustomFields).where(eq(orderCustomFields.orderId, orderId)),
-    db.select().from(orderStatusHistory).where(eq(orderStatusHistory.orderId, orderId)).orderBy(asc(orderStatusHistory.createdAt)),
-    db
-      .select({ id: orders.id, orderNumber: orders.orderNumber, status: orders.status, total: orders.total, createdAt: orders.createdAt })
-      .from(orders)
-      .where(and(eq(orders.businessId, businessId), eq(orders.customerId, row.customer.id)))
-      .orderBy(desc(orders.createdAt))
-      .limit(10),
-  ]);
+  const s = await store();
+  const order = fromDoc<Order>(await s.orders(businessId).doc(orderId).get());
+  if (!order) throw notFound("Order not found");
+  const customer = fromDoc<Customer>(await s.customers(businessId).doc(order.customerId).get());
+  if (!customer) throw notFound("Order not found");
+  const otherOrders = (await customerOrders(businessId, customer.id, 10)).map(({ id, orderNumber, status, total, createdAt }) => ({
+    id,
+    orderNumber,
+    status,
+    total,
+    createdAt,
+  }));
   let conversation: { id: string; aiEnabled: boolean; status: string } | null = null;
-  let recentMessages: (typeof messages.$inferSelect)[] = [];
-  if (row.order.conversationId) {
-    const [conv] = await db
-      .select({ id: conversations.id, aiEnabled: conversations.aiEnabled, status: conversations.status })
-      .from(conversations)
-      .where(and(eq(conversations.id, row.order.conversationId), eq(conversations.businessId, businessId)));
-    conversation = conv ?? null;
+  let recentMessages: Message[] = [];
+  if (order.conversationId) {
+    const conv = fromDoc<Conversation>(await s.conversations(businessId).doc(order.conversationId).get());
     if (conv) {
-      recentMessages = (
-        await db.select().from(messages).where(eq(messages.conversationId, conv.id)).orderBy(desc(messages.createdAt)).limit(12)
-      ).reverse();
+      conversation = { id: conv.id, aiEnabled: conv.aiEnabled, status: conv.status };
+      recentMessages = fromDocs<Message>(await s.messages(businessId, conv.id).orderBy("createdAt", "desc").limit(12).get()).reverse();
     }
   }
-  return { ...row, items, customFields, history, otherOrders, conversation, recentMessages };
+  return {
+    order,
+    customer,
+    items: order.items,
+    customFields: order.customFields,
+    history: [...order.history].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+    otherOrders,
+    conversation,
+    recentMessages,
+  };
 }
 
 export async function updateOrderNotes(
@@ -107,14 +117,13 @@ export async function updateOrderNotes(
   input: { internalNotes?: string; trackingNumber?: string },
   actor: AuditActor,
 ) {
-  const db = await getDb();
-  const [row] = await db
-    .update(orders)
-    .set(input)
-    .where(and(eq(orders.id, orderId), eq(orders.businessId, businessId)))
-    .returning();
-  if (!row) throw notFound("Order not found");
+  const s = await store();
+  const ref = s.orders(businessId).doc(orderId);
+  const current = fromDoc<Order>(await ref.get());
+  if (!current) throw notFound("Order not found");
+  const patch = { ...input, updatedAt: new Date() };
+  await ref.update(patch);
   await audit(businessId, actor, "order.updated", { type: "order", id: orderId }, { fields: Object.keys(input) });
-  publish(businessId, { type: "order.updated", orderId, orderNumber: row.orderNumber, status: row.status });
-  return row;
+  publish(businessId, { type: "order.updated", orderId, orderNumber: current.orderNumber, status: current.status });
+  return { ...current, ...patch };
 }

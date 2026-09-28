@@ -1,11 +1,11 @@
 import "server-only";
-import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { getDb } from "@/db";
-import { auditLogs, businessMembers, businesses, sessions, users } from "@/db/schema";
+import { fromDoc, fromDocs, newId, store } from "@/db";
+import type { AuditLog, Business, Membership, Session, User } from "@/db/schema";
 import { audit, type AuditActor } from "../audit";
+import { membershipId } from "../auth";
 import { hashPassword } from "../crypto";
-import { ApiError, cleanText, forbidden, notFound } from "../http";
+import { ApiError, cleanText, docId, forbidden, notFound } from "../http";
 
 /* ------------------------------------------------------------------ */
 /* Business profile                                                    */
@@ -82,43 +82,43 @@ export const BusinessInput = z.object({
 export type BusinessProfile = Awaited<ReturnType<typeof getBusinessProfile>>;
 
 export async function getBusinessProfile(businessId: string) {
-  const db = await getDb();
-  const [row] = await db
-    .select({
-      id: businesses.id,
-      name: businesses.name,
-      logoUrl: businesses.logoUrl,
-      description: businesses.description,
-      phone: businesses.phone,
-      email: businesses.email,
-      address: businesses.address,
-      website: businesses.website,
-      whatsappNumber: businesses.whatsappNumber,
-      openingHours: businesses.openingHours,
-      deliveryInfo: businesses.deliveryInfo,
-      deliveryFee: businesses.deliveryFee,
-      paymentMethods: businesses.paymentMethods,
-      bankDetails: businesses.bankDetails,
-      returnPolicy: businesses.returnPolicy,
-      exchangePolicy: businesses.exchangePolicy,
-      currency: businesses.currency,
-      timezone: businesses.timezone,
-      lowStockThreshold: businesses.lowStockThreshold,
-      updatedAt: businesses.updatedAt,
-    })
-    .from(businesses)
-    .where(eq(businesses.id, businessId))
-    .limit(1);
+  const s = await store();
+  const row = fromDoc<Business>(await s.businesses.doc(businessId).get());
   if (!row) throw notFound("Business not found");
-  return row;
+  return {
+    id: row.id,
+    name: row.name,
+    logoUrl: row.logoUrl,
+    description: row.description,
+    phone: row.phone,
+    email: row.email,
+    address: row.address,
+    website: row.website,
+    whatsappNumber: row.whatsappNumber,
+    openingHours: row.openingHours,
+    deliveryInfo: row.deliveryInfo,
+    deliveryFee: row.deliveryFee,
+    paymentMethods: row.paymentMethods,
+    bankDetails: row.bankDetails,
+    returnPolicy: row.returnPolicy,
+    exchangePolicy: row.exchangePolicy,
+    currency: row.currency,
+    timezone: row.timezone,
+    lowStockThreshold: row.lowStockThreshold,
+    updatedAt: row.updatedAt,
+  };
 }
 
 export async function updateBusinessProfile(businessId: string, input: Partial<z.infer<typeof BusinessInput>>, actor: AuditActor) {
-  const db = await getDb();
-  if (Object.keys(input).length) {
-    const [row] = await db.update(businesses).set(input).where(eq(businesses.id, businessId)).returning({ id: businesses.id });
-    if (!row) throw notFound("Business not found");
-    await audit(businessId, actor, "business.updated", { type: "business", id: businessId }, { fields: Object.keys(input) });
+  const s = await store();
+  const fields = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
+  if (Object.keys(fields).length) {
+    const ref = s.businesses.doc(businessId);
+    await s.db.runTransaction(async (tx) => {
+      if (!(await tx.get(ref)).exists) throw notFound("Business not found");
+      tx.update(ref, { ...fields, updatedAt: new Date() });
+    });
+    await audit(businessId, actor, "business.updated", { type: "business", id: businessId }, { fields: Object.keys(fields) });
   }
   return getBusinessProfile(businessId);
 }
@@ -133,52 +133,53 @@ export const MemberInput = z.object({
   password: z.string().min(8, "Use at least 8 characters").max(200),
 });
 
-export async function listMembers(businessId: string) {
-  const db = await getDb();
-  return db
-    .select({
-      id: businessMembers.id,
-      userId: users.id,
-      name: users.name,
-      email: users.email,
-      role: businessMembers.role,
-      joinedAt: businessMembers.createdAt,
-    })
-    .from(businessMembers)
-    .innerJoin(users, eq(users.id, businessMembers.userId))
-    .where(eq(businessMembers.businessId, businessId))
-    .orderBy(asc(businessMembers.createdAt));
-}
+export type MemberRow = {
+  /** Membership document id ({businessId}_{userId}). */
+  id: string;
+  userId: string;
+  name: string;
+  email: string;
+  role: Membership["role"];
+  joinedAt: Date;
+};
 
-export type MemberRow = Awaited<ReturnType<typeof listMembers>>[number];
+export async function listMembers(businessId: string): Promise<MemberRow[]> {
+  const s = await store();
+  const members = fromDocs<Membership>(await s.memberships.where("businessId", "==", businessId).get());
+  if (!members.length) return [];
+  const userSnaps = await s.db.getAll(...members.map((m) => s.users.doc(m.userId)));
+  const users = new Map(userSnaps.map((snap) => fromDoc<User>(snap)).filter((u): u is User => Boolean(u)).map((u) => [u.id, u]));
+  return members
+    .filter((m) => users.has(m.userId))
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .map((m) => {
+      const user = users.get(m.userId)!;
+      return { id: m.id, userId: user.id, name: user.name, email: user.email, role: m.role, joinedAt: m.createdAt };
+    });
+}
 
 const EMAIL_TAKEN = "An account with this email already exists. Use a different email address.";
 
-export async function addStaffMember(businessId: string, input: z.infer<typeof MemberInput>, actor: AuditActor) {
-  const db = await getDb();
-  const [taken] = await db.select({ id: users.id }).from(users).where(eq(users.email, input.email)).limit(1);
-  if (taken) throw new ApiError(409, EMAIL_TAKEN);
+export async function addStaffMember(businessId: string, input: z.infer<typeof MemberInput>, actor: AuditActor): Promise<MemberRow> {
+  const s = await store();
+  const email = input.email.trim().toLowerCase();
   const passwordHash = await hashPassword(input.password);
-  try {
-    const member = await db.transaction(async (tx) => {
-      const [user] = await tx.insert(users).values({ email: input.email, name: input.name, passwordHash }).returning();
-      const [row] = await tx.insert(businessMembers).values({ businessId, userId: user.id, role: "staff" }).returning();
-      return { id: row.id, userId: user.id, name: user.name, email: user.email, role: row.role, joinedAt: row.createdAt };
-    });
-    await audit(businessId, actor, "member.added", { type: "user", id: member.userId }, { email: member.email, role: "staff" });
-    return member;
-  } catch (err) {
-    // Two requests racing for the same email hit the unique index.
-    if (isUniqueViolation(err)) throw new ApiError(409, EMAIL_TAKEN);
-    throw err;
-  }
-}
+  const userId = newId();
+  const now = new Date();
+  const id = membershipId(businessId, userId);
 
-function isUniqueViolation(err: unknown): boolean {
-  for (let e = err as { code?: string; cause?: unknown } | undefined, depth = 0; e && depth < 4; e = e.cause as typeof e, depth += 1) {
-    if (e.code === "23505") return true;
-  }
-  return false;
+  // userEmails/{email} is the unique index: two requests racing for one email can't both win.
+  await s.db.runTransaction(async (tx) => {
+    const taken = await tx.get(s.userEmails.doc(email));
+    if (taken.exists) throw new ApiError(409, EMAIL_TAKEN);
+    tx.create(s.userEmails.doc(email), { userId });
+    tx.create(s.users.doc(userId), { email, name: input.name, passwordHash, createdAt: now, updatedAt: now });
+    tx.create(s.memberships.doc(id), { businessId, userId, role: "staff", createdAt: now });
+  });
+
+  const member: MemberRow = { id, userId, name: input.name, email, role: "staff", joinedAt: now };
+  await audit(businessId, actor, "member.added", { type: "user", id: userId }, { email, role: "staff" });
+  return member;
 }
 
 /**
@@ -186,25 +187,39 @@ function isUniqueViolation(err: unknown): boolean {
  * longer belongs to any business is deleted so the email can be invited again.
  */
 export async function removeMember(businessId: string, memberId: string, actor: AuditActor) {
-  if (!z.uuid().safeParse(memberId).success) throw notFound("Team member not found");
-  const db = await getDb();
-  const [member] = await db
-    .select({ id: businessMembers.id, userId: businessMembers.userId, role: businessMembers.role, email: users.email })
-    .from(businessMembers)
-    .innerJoin(users, eq(users.id, businessMembers.userId))
-    .where(and(eq(businessMembers.id, memberId), eq(businessMembers.businessId, businessId)))
-    .limit(1);
-  if (!member) throw notFound("Team member not found");
+  if (!docId.safeParse(memberId).success) throw notFound("Team member not found");
+  const s = await store();
+  const memberRef = s.memberships.doc(memberId);
+  const member = fromDoc<Membership>(await memberRef.get());
+  if (!member || member.businessId !== businessId) throw notFound("Team member not found");
   if (member.userId === actor.userId) throw forbidden("You can't remove yourself.");
   if (member.role === "owner") throw forbidden("The business owner can't be removed.");
 
-  await db.transaction(async (tx) => {
-    await tx.delete(businessMembers).where(eq(businessMembers.id, member.id));
-    await tx.delete(sessions).where(and(eq(sessions.userId, member.userId), eq(sessions.businessId, businessId)));
-    const [other] = await tx.select({ id: businessMembers.id }).from(businessMembers).where(eq(businessMembers.userId, member.userId)).limit(1);
-    if (!other) await tx.delete(users).where(eq(users.id, member.userId));
+  const email = await s.db.runTransaction(async (tx) => {
+    const [memberSnap, userSnap, others, sessions] = await Promise.all([
+      tx.get(memberRef),
+      tx.get(s.users.doc(member.userId)),
+      tx.get(s.memberships.where("userId", "==", member.userId)),
+      tx.get(s.sessions.where("userId", "==", member.userId)),
+    ]);
+    if (!memberSnap.exists) throw notFound("Team member not found");
+    const user = fromDoc<User>(userSnap);
+    const orphaned = Boolean(user) && !others.docs.some((doc) => doc.id !== memberId);
+    // Firestore transactions read everything before the first write.
+    const emailIndex = orphaned && user ? await tx.get(s.userEmails.doc(user.email)) : null;
+
+    tx.delete(memberRef);
+    for (const session of fromDocs<Session>(sessions)) {
+      if (session.businessId === businessId) tx.delete(s.sessions.doc(session.id));
+    }
+    if (orphaned && user) {
+      tx.delete(s.users.doc(user.id));
+      // Only drop the email index if it still points at this user.
+      if ((emailIndex?.data() as { userId?: string } | undefined)?.userId === user.id) tx.delete(s.userEmails.doc(user.email));
+    }
+    return user?.email ?? null;
   });
-  await audit(businessId, actor, "member.removed", { type: "user", id: member.userId }, { email: member.email });
+  await audit(businessId, actor, "member.removed", { type: "user", id: member.userId }, { email });
 }
 
 /* ------------------------------------------------------------------ */
@@ -212,22 +227,24 @@ export async function removeMember(businessId: string, memberId: string, actor: 
 /* ------------------------------------------------------------------ */
 
 export async function listAuditLogs(businessId: string, limit = 100) {
-  const db = await getDb();
-  return db
-    .select({
-      id: auditLogs.id,
-      actor: auditLogs.actor,
-      action: auditLogs.action,
-      entityType: auditLogs.entityType,
-      entityId: auditLogs.entityId,
-      metadata: auditLogs.metadata,
-      ip: auditLogs.ip,
-      createdAt: auditLogs.createdAt,
-    })
-    .from(auditLogs)
-    .where(eq(auditLogs.businessId, businessId))
-    .orderBy(desc(auditLogs.createdAt))
-    .limit(Math.min(Math.max(1, limit), 100));
+  const s = await store();
+  const rows = fromDocs<AuditLog>(
+    await s
+      .auditLogs(businessId)
+      .orderBy("createdAt", "desc")
+      .limit(Math.min(Math.max(1, limit), 100))
+      .get(),
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    actor: row.actor,
+    action: row.action,
+    entityType: row.entityType,
+    entityId: row.entityId,
+    metadata: row.metadata,
+    ip: row.ip,
+    createdAt: row.createdAt,
+  }));
 }
 
 export type AuditRow = Awaited<ReturnType<typeof listAuditLogs>>[number];

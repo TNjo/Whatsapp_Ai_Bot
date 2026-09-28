@@ -1,1 +1,0 @@
-ALTER TABLE "customers" ADD COLUMN "wa_chat_id" text;

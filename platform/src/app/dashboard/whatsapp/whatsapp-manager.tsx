@@ -15,7 +15,6 @@ import {
   KeyRound,
   Loader2,
   MessageCircle,
-  QrCode,
   RefreshCw,
   Server,
   Settings2,
@@ -37,11 +36,8 @@ import { TemplatesTab, type Template } from "./templates-tab";
 import { MessagesTab, type StatusMessage } from "./messages-tab";
 
 type Health = { key: string; label: string; ok: boolean; detail: string };
-type LinkState = { status: "idle" | "starting" | "qr" | "authenticated" | "ready" | "disconnected" | "error"; qr: string | null; error: string | null };
 type Overview = {
   status: "disconnected" | "connecting" | "connected" | "error";
-  mode: "cloud" | "qr" | null;
-  link: LinkState;
   setup: {
     embeddedSignupAvailable: boolean;
     appId: string | null;
@@ -53,7 +49,7 @@ type Overview = {
     serverCredentialsAvailable: boolean;
   };
   connection: {
-    connectedVia: "embedded_signup" | "manual" | "qr" | null;
+    connectedVia: "embedded_signup" | "manual" | null;
     wabaId: string | null;
     wabaName: string | null;
     phoneNumberId: string | null;
@@ -124,19 +120,7 @@ export function WhatsAppManager({
         ))}
       </nav>
       {tab === "connection" ? <ConnectionTab overview={overview} isOwner={isOwner} businessName={businessName} /> : null}
-      {tab === "templates" ? (
-        overview.mode === "qr" ? (
-          <div className="rounded-xl border bg-card p-6 text-sm text-muted-foreground shadow-xs">
-            <p className="font-medium text-foreground">Templates aren&apos;t needed for a linked WhatsApp number.</p>
-            <p className="mt-1">
-              Linked devices can message customers at any time, so order updates always use your status messages. Templates only apply to the
-              official WhatsApp Business API.
-            </p>
-          </div>
-        ) : (
-          <TemplatesTab templates={templates} isOwner={isOwner} connected={overview.status === "connected"} />
-        )
-      ) : null}
+      {tab === "templates" ? <TemplatesTab templates={templates} isOwner={isOwner} connected={overview.status === "connected"} /> : null}
       {tab === "messages" ? <MessagesTab messages={statusMessages} isOwner={isOwner} /> : null}
     </>
   );
@@ -326,10 +310,6 @@ function ConnectionTab({ overview, isOwner, businessName }: { overview: Overview
     );
   }
 
-  // A new link in progress (a saved device reconnecting after a restart stays on the connected view).
-  const linking = overview.status !== "connected" && ["starting", "qr", "authenticated"].includes(overview.link.status);
-  if (linking) return <LinkPanel link={overview.link} />;
-
   if (!connected) {
     return (
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
@@ -368,7 +348,6 @@ function ConnectionTab({ overview, isOwner, businessName }: { overview: Overview
               ) : null}
             </div>
           </div>
-          {isOwner ? <LinkNumberCard /> : null}
           {showManual && isOwner ? <ManualConnect serverAvailable={overview.setup.serverCredentialsAvailable} /> : null}
         </div>
         <SetupChecklist setup={overview.setup} />
@@ -377,7 +356,6 @@ function ConnectionTab({ overview, isOwner, businessName }: { overview: Overview
   }
 
   const healthy = c.health.length > 0 && c.health.every((h) => h.ok);
-  if (overview.mode === "qr") return <LinkedConnected overview={overview} isOwner={isOwner} businessName={businessName} checking={checking} recheck={recheck} />;
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
       <div className="flex flex-col gap-6">
@@ -587,228 +565,3 @@ function SetupChecklist({ setup, compact }: { setup: Overview["setup"]; compact?
   );
 }
 
-/** Unofficial QR linking for ordinary WhatsApp numbers (personal or WhatsApp Business app). */
-function LinkNumberCard() {
-  const router = useRouter();
-  const [busy, setBusy] = useState(false);
-  const [accepted, setAccepted] = useState(false);
-  const start = async () => {
-    setBusy(true);
-    try {
-      await api("/api/whatsapp/link", { body: {} });
-      router.refresh();
-    } catch (err) {
-      toast.error(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <SectionCard
-      title={
-        <span className="flex items-center gap-2">
-          <QrCode className="size-4" /> Link a normal WhatsApp number
-        </span>
-      }
-      description="Use any WhatsApp number — personal or the WhatsApp Business app — by scanning a QR code, like WhatsApp Web."
-    >
-      <div className="grid gap-4">
-        <div className="flex gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-          <div className="grid gap-1">
-            <p className="font-semibold">Unofficial connection — use at your own risk</p>
-            <p>
-              This automates WhatsApp Web, which WhatsApp doesn&apos;t officially allow. WhatsApp may restrict or ban numbers that send automated
-              messages. Avoid bulk or unsolicited messages, and prefer the official WhatsApp Business API for important numbers.
-            </p>
-          </div>
-        </div>
-        <label className="flex items-start gap-2.5 text-sm">
-          <input type="checkbox" className="mt-0.5 size-4 accent-primary" checked={accepted} onChange={(e) => setAccepted(e.target.checked)} />
-          I understand the risk and want to link this number anyway.
-        </label>
-        <Button variant="outline" onClick={start} disabled={!accepted || busy} className="justify-self-start">
-          {busy ? <Loader2 className="size-4 animate-spin" /> : <QrCode className="size-4" />} Show QR code
-        </Button>
-      </div>
-    </SectionCard>
-  );
-}
-
-function LinkPanel({ link }: { link: LinkState }) {
-  const router = useRouter();
-  const [cancelling, setCancelling] = useState(false);
-  // Realtime events refresh the page; this poll is a fallback if the event stream drops.
-  useEffect(() => {
-    const timer = setInterval(() => router.refresh(), 5000);
-    return () => clearInterval(timer);
-  }, [router]);
-  const cancel = async () => {
-    setCancelling(true);
-    try {
-      await api("/api/whatsapp/link", { method: "DELETE" });
-      router.refresh();
-    } catch (err) {
-      toast.error(errorMessage(err));
-    } finally {
-      setCancelling(false);
-    }
-  };
-  return (
-    <div className="mx-auto grid max-w-3xl gap-6 rounded-2xl border bg-card p-6 shadow-xs md:grid-cols-[300px_minmax(0,1fr)] md:p-8">
-      <div className="grid aspect-square place-items-center rounded-xl border bg-white p-3">
-        {link.status === "qr" && link.qr ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={link.qr} alt="WhatsApp QR code" className="size-full" />
-        ) : (
-          <div className="flex flex-col items-center gap-3 text-center text-sm text-zinc-500">
-            <Loader2 className="size-7 animate-spin text-emerald-600" />
-            {link.status === "authenticated" ? "Phone linked — loading your chats…" : "Starting a secure WhatsApp Web session…"}
-          </div>
-        )}
-      </div>
-      <div className="flex flex-col">
-        <h2 className="text-xl font-semibold">Scan to link your WhatsApp</h2>
-        <ol className="mt-4 grid gap-3 text-sm">
-          {[
-            "Open WhatsApp on the phone with the number you want to use.",
-            "Tap ⋮ (Android) or Settings (iPhone), then Linked devices.",
-            "Tap Link a device and point the camera at this code.",
-          ].map((step, i) => (
-            <li key={step} className="flex gap-3">
-              <span className="grid size-6 shrink-0 place-items-center rounded-full bg-primary/10 text-xs font-semibold text-primary">{i + 1}</span>
-              <span className="pt-0.5">{step}</span>
-            </li>
-          ))}
-        </ol>
-        <p className="mt-4 text-xs text-muted-foreground">The code refreshes automatically. Keep this page open until it says connected.</p>
-        <div className="mt-auto flex items-center gap-2 pt-6">
-          <Button variant="outline" onClick={cancel} disabled={cancelling}>
-            {cancelling ? <Loader2 className="size-4 animate-spin" /> : null} Cancel
-          </Button>
-          <span className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-300">
-            <AlertTriangle className="size-3.5" /> Unofficial connection
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function LinkedConnected({
-  overview,
-  isOwner,
-  businessName,
-  checking,
-  recheck,
-}: {
-  overview: Overview;
-  isOwner: boolean;
-  businessName: string;
-  checking: boolean;
-  recheck: () => void;
-}) {
-  const router = useRouter();
-  const c = overview.connection!;
-  const live = overview.link.status === "ready";
-  return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
-      <div className="flex flex-col gap-6">
-        <div className="overflow-hidden rounded-2xl border bg-card shadow-xs">
-          <div className="flex flex-col gap-5 bg-gradient-to-br from-emerald-50 to-transparent p-6 sm:flex-row sm:items-center dark:from-emerald-500/10">
-            <span className={cn("grid size-14 shrink-0 place-items-center rounded-2xl text-white shadow-sm", live ? "bg-emerald-500" : "bg-amber-500")}>
-              {live ? <Check className="size-7" strokeWidth={3} /> : <Loader2 className="size-7 animate-spin" />}
-            </span>
-            <div className="min-w-0 flex-1">
-              <p className={cn("text-sm font-medium", live ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300")}>
-                {live ? "WhatsApp Connected" : "Reconnecting to WhatsApp…"}
-              </p>
-              <h2 className="truncate text-xl font-semibold">{c.verifiedName || businessName}</h2>
-              <p className="text-sm text-muted-foreground">{c.displayPhoneNumber ? formatPhone(c.displayPhoneNumber) : "—"}</p>
-            </div>
-            <span className="inline-flex items-center gap-1.5 self-start rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800 sm:self-center dark:bg-amber-500/15 dark:text-amber-300">
-              <QrCode className="size-3.5" /> Linked device · unofficial
-            </span>
-          </div>
-          <dl className="grid grid-cols-2 gap-px border-t bg-border sm:grid-cols-4">
-            {[
-              { label: "Connection", value: "Linked device (QR)" },
-              { label: "Bot", value: overview.bot.aiEnabled ? "● Active" : "Paused" },
-              { label: "Messages", value: overview.stats.messages.toLocaleString() },
-              { label: "Orders", value: overview.stats.orders.toLocaleString() },
-            ].map((item) => (
-              <div key={item.label} className="bg-card px-5 py-3">
-                <dt className="text-xs text-muted-foreground">{item.label}</dt>
-                <dd className="truncate text-sm font-semibold">{item.value}</dd>
-              </div>
-            ))}
-          </dl>
-          <div className="flex flex-wrap gap-2 border-t p-4">
-            <Link href="/dashboard/conversations" className={buttonVariants()}>
-              <MessageCircle className="size-4" /> Open conversations
-            </Link>
-            <Link href="/dashboard/bot" className={buttonVariants({ variant: "outline" })}>
-              <Bot className="size-4" /> Bot settings
-            </Link>
-            <Button variant="outline" onClick={recheck} disabled={checking}>
-              {checking ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />} Check connection
-            </Button>
-            {isOwner ? (
-              <ConfirmButton
-                variant="ghost"
-                className="ml-auto text-rose-600 hover:text-rose-700"
-                title="Unlink this WhatsApp?"
-                description="This logs the linked device out of WhatsApp and deletes the saved session from this server. Conversations and orders are kept."
-                confirmLabel="Unlink"
-                destructive
-                onConfirm={async () => {
-                  try {
-                    await api("/api/whatsapp/disconnect", { body: {} });
-                    toast.success("WhatsApp unlinked");
-                    router.refresh();
-                  } catch (err) {
-                    toast.error(errorMessage(err));
-                  }
-                }}
-              >
-                <Unplug className="size-4" /> Unlink
-              </ConfirmButton>
-            ) : null}
-          </div>
-        </div>
-
-        <SectionCard title="Connection health" description={c.lastHealthCheckAt ? `Checked ${relativeTime(c.lastHealthCheckAt)}` : undefined} bodyClassName="p-0">
-          <ul className="divide-y">
-            {c.health.map((check) => (
-              <li key={check.key} className="flex items-start gap-3 px-5 py-3">
-                {check.ok ? <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-emerald-500" /> : <XCircle className="mt-0.5 size-5 shrink-0 text-rose-500" />}
-                <div className="min-w-0">
-                  <p className="text-sm font-medium">{check.label}</p>
-                  <p className="text-sm break-words text-muted-foreground">{check.detail}</p>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </SectionCard>
-      </div>
-      <div className="flex flex-col gap-6">
-        <SectionCard title="How linked devices work">
-          <ul className="grid gap-3 text-sm text-muted-foreground">
-            <li>The assistant replies through a WhatsApp Web session running on this server. Keep the server running.</li>
-            <li>Your phone keeps working normally. When you reply from the phone, that chat pauses the AI so you can take over.</li>
-            <li>Buttons are sent as numbered options — customers reply “1”, “2”… or the option&apos;s name.</li>
-            <li>No 24-hour window or templates: order updates can be sent any time.</li>
-            <li>Open WhatsApp on the phone at least every couple of weeks, or WhatsApp logs linked devices out.</li>
-          </ul>
-        </SectionCard>
-        <div className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-          <p>
-            Unofficial connection: WhatsApp may restrict numbers that send automated messages. For long-term use, move to the official WhatsApp
-            Business API (unlink here, then connect it).
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}

@@ -1,7 +1,6 @@
 import "server-only";
-import { and, asc, eq } from "drizzle-orm";
-import { getDb, type DbOrTx } from "@/db";
-import { botKnowledge, botSettings, businesses, faqs, type BotRule } from "@/db/schema";
+import { fromDoc, fromDocs, isAlreadyExists, store } from "@/db";
+import type { BotRule, BotSettings, Business, Faq, KnowledgeNote } from "@/db/schema";
 import { resolveAIConfig } from "../ai/service";
 import { getOrderFields } from "../commerce/order-form";
 
@@ -32,37 +31,45 @@ export function defaultBotSettings(businessName: string) {
   };
 }
 
-export async function ensureBotSettings(businessId: string, tx?: DbOrTx) {
-  const db = tx ?? (await getDb());
-  const [existing] = await db.select().from(botSettings).where(eq(botSettings.businessId, businessId));
+export async function ensureBotSettings(businessId: string): Promise<BotSettings> {
+  const s = await store();
+  const ref = s.bot(businessId);
+  const existing = fromDoc<BotSettings & { id: string }>(await ref.get());
   if (existing) return existing;
-  const [business] = await db.select({ name: businesses.name }).from(businesses).where(eq(businesses.id, businessId));
-  const [created] = await db
-    .insert(botSettings)
-    .values({ businessId, ...defaultBotSettings(business?.name ?? "our store") })
-    .onConflictDoNothing()
-    .returning();
-  if (created) return created;
-  const [raced] = await db.select().from(botSettings).where(eq(botSettings.businessId, businessId));
-  return raced;
+  const business = fromDoc<Business>(await s.businesses.doc(businessId).get());
+  const created: BotSettings = {
+    businessId,
+    ...defaultBotSettings(business?.name ?? "our store"),
+    aiEnabled: true,
+    humanHandoffEnabled: true,
+    aiProvider: null,
+    aiModel: "",
+    aiBaseUrl: "",
+    aiApiKeyEnc: null,
+    temperature: 30,
+    testModeCreatesOrders: false,
+    statusMessages: {},
+    updatedAt: new Date(),
+  };
+  try {
+    await ref.create(created);
+    return created;
+  } catch (err) {
+    if (!isAlreadyExists(err)) throw err;
+    return fromDoc<BotSettings & { id: string }>(await ref.get())!;
+  }
 }
 
 /** Everything the bot needs about a business for one turn. */
 export async function loadBotContext(businessId: string) {
-  const db = await getDb();
-  const settings = await ensureBotSettings(businessId);
-  const [business] = await db.select().from(businesses).where(eq(businesses.id, businessId));
-  const faqRows = await db
-    .select()
-    .from(faqs)
-    .where(and(eq(faqs.businessId, businessId), eq(faqs.enabled, true)))
-    .orderBy(asc(faqs.sortOrder), asc(faqs.createdAt));
-  const knowledge = await db
-    .select()
-    .from(botKnowledge)
-    .where(and(eq(botKnowledge.businessId, businessId), eq(botKnowledge.enabled, true)))
-    .orderBy(asc(botKnowledge.createdAt));
-  const orderFields = await getOrderFields(businessId);
+  const s = await store();
+  const [settings, business, faqRows, knowledge, orderFields] = await Promise.all([
+    ensureBotSettings(businessId),
+    s.businesses.doc(businessId).get().then((snap) => fromDoc<Business>(snap)!),
+    s.faqs(businessId).orderBy("sortOrder").get().then((snap) => fromDocs<Faq>(snap).filter((f) => f.enabled)),
+    s.knowledge(businessId).orderBy("createdAt").get().then((snap) => fromDocs<KnowledgeNote>(snap).filter((k) => k.enabled)),
+    getOrderFields(businessId),
+  ]);
   return { business, settings, faqs: faqRows, knowledge, orderFields, aiConfig: resolveAIConfig(settings) };
 }
 

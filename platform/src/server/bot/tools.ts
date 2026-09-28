@@ -1,9 +1,10 @@
 import "server-only";
 import { z } from "zod";
-import type { conversations, customers } from "@/db/schema";
+import type { Conversation, Customer } from "@/db/schema";
 import { formatMoney, variantLabel } from "@/lib/format";
 import { STATUS_EMOJI, STATUS_LABEL } from "@/lib/order-status";
 import { requestHumanSupport } from "../conversations";
+import { docId } from "../http";
 import { log } from "../logger";
 import type { JsonSchema, ToolDefinition } from "../ai/types";
 import {
@@ -27,8 +28,8 @@ import type { BotContext } from "./settings";
 
 export type ToolRuntime = {
   businessId: string;
-  conversation: typeof conversations.$inferSelect;
-  customer: typeof customers.$inferSelect;
+  conversation: Conversation;
+  customer: Customer;
   bot: BotContext;
   isTest: boolean;
   /** When the message being answered arrived — used to prove confirmation came after the review. */
@@ -118,8 +119,8 @@ function cartSummary(rt: ToolRuntime, view: CartView) {
 }
 
 const itemInput = z.object({
-  productId: z.string().uuid().optional(),
-  serviceId: z.string().uuid().optional(),
+  productId: docId.optional(),
+  serviceId: docId.optional(),
   quantity: z.number().int().min(1).max(99).default(1),
   options: z.record(z.string(), z.string()).optional(),
 });
@@ -176,7 +177,7 @@ export const TOOLS = [
   tool({
     name: "getProduct",
     description: "Get full details of one product (description, options, per-option availability).",
-    schema: z.object({ productId: z.string().uuid() }),
+    schema: z.object({ productId: docId }),
     parameters: { type: "object", properties: { productId: { type: "string" } }, required: ["productId"] },
     async run(rt, args) {
       const found = await getProduct(rt.businessId, args.productId);
@@ -187,7 +188,7 @@ export const TOOLS = [
   tool({
     name: "checkStock",
     description: "Check whether a product (optionally a specific option combination) is in stock for a quantity.",
-    schema: z.object({ productId: z.string().uuid(), options: z.record(z.string(), z.string()).optional(), quantity: z.number().int().min(1).max(99).default(1) }),
+    schema: z.object({ productId: docId, options: z.record(z.string(), z.string()).optional(), quantity: z.number().int().min(1).max(99).default(1) }),
     parameters: {
       type: "object",
       properties: {
@@ -316,10 +317,10 @@ export const TOOLS = [
     schema: z.object({
       addItems: z.array(itemInput).max(10).optional(),
       updateItems: z
-        .array(z.object({ itemId: z.string().uuid(), quantity: z.number().int().min(0).max(99).optional(), options: z.record(z.string(), z.string()).optional() }))
+        .array(z.object({ itemId: docId, quantity: z.number().int().min(0).max(99).optional(), options: z.record(z.string(), z.string()).optional() }))
         .max(10)
         .optional(),
-      removeItemIds: z.array(z.string().uuid()).max(10).optional(),
+      removeItemIds: z.array(docId).max(10).optional(),
       fields: z.record(z.string(), z.string()).optional(),
     }),
     parameters: {
@@ -384,7 +385,7 @@ export const TOOLS = [
       if (!cart) return { data: { error: "No draft order." }, isError: true };
       const view = await viewCart(rt.businessId, cart);
       if (!view.readyForReview) return { data: { error: "Not ready for review.", draftOrder: cartSummary(rt, view) }, isError: true };
-      await markReviewSent(cart.id, view.reviewHash);
+      await markReviewSent(rt.businessId, cart.id, view.reviewHash);
       const labels = new Map(rt.bot.orderFields.map((field) => [field.key, field.label]));
       return {
         data: { sent: true },
@@ -477,7 +478,7 @@ export const TOOLS = [
   tool({
     name: "showProduct",
     description: "Send one product to the customer as a card (photo, price, options) with an Order button. Sends the message itself.",
-    schema: z.object({ productId: z.string().uuid() }),
+    schema: z.object({ productId: docId }),
     parameters: { type: "object", properties: { productId: { type: "string" } }, required: ["productId"] },
     async run(rt, args) {
       const card = await productCard(rt, args.productId);

@@ -1,8 +1,8 @@
 import "server-only";
-import { and, asc, eq, ilike, or } from "drizzle-orm";
 import { z } from "zod";
-import { getDb } from "@/db";
-import { categories, services } from "@/db/schema";
+import { fromDoc, fromDocs, newId, store, toDoc } from "@/db";
+import type { Service } from "@/db/schema";
+import { categoryNames } from "../commerce/catalog";
 import { audit, type AuditActor } from "../audit";
 import { cleanText, notFound } from "../http";
 import { resolveCategory } from "./categories";
@@ -21,57 +21,57 @@ export const ServiceInput = z.object({
 });
 
 export async function listServices(businessId: string, query = "") {
-  const db = await getDb();
-  const q = query.trim();
-  return db
-    .select({
-      id: services.id,
-      name: services.name,
-      description: services.description,
-      price: services.price,
-      durationMinutes: services.durationMinutes,
-      availability: services.availability,
-      status: services.status,
-      category: categories.name,
-      updatedAt: services.updatedAt,
-    })
-    .from(services)
-    .leftJoin(categories, eq(categories.id, services.categoryId))
-    .where(and(eq(services.businessId, businessId), q ? or(ilike(services.name, `%${q}%`), ilike(services.description, `%${q}%`)) : undefined))
-    .orderBy(asc(services.name));
+  const s = await store();
+  const [rows, cats] = await Promise.all([fromDocs<Service>(await s.services(businessId).get()), categoryNames(businessId)]);
+  const q = query.trim().toLowerCase();
+  return rows
+    .filter((row) => !q || `${row.name} ${row.description}`.toLowerCase().includes(q))
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      price: row.price,
+      durationMinutes: row.durationMinutes,
+      availability: row.availability,
+      status: row.status,
+      category: row.categoryId ? (cats.get(row.categoryId) ?? null) : null,
+      updatedAt: row.updatedAt,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export type ServiceRow = Awaited<ReturnType<typeof listServices>>[number];
 
 export async function createService(businessId: string, input: z.infer<typeof ServiceInput>, actor: AuditActor) {
-  const db = await getDb();
+  const s = await store();
   const categoryId = await resolveCategory(businessId, "service", input.category);
-  const [row] = await db
-    .insert(services)
-    .values({ businessId, categoryId, ...input, durationMinutes: input.durationMinutes ?? null })
-    .returning();
+  const { category: _category, ...rest } = input;
+  void _category;
+  const now = new Date();
+  const row: Service = { id: newId(), businessId, categoryId, ...rest, durationMinutes: input.durationMinutes ?? null, createdAt: now, updatedAt: now };
+  await s.services(businessId).doc(row.id).set(toDoc(row));
   await audit(businessId, actor, "service.created", { type: "service", id: row.id }, { name: row.name });
   return row;
 }
 
 export async function updateService(businessId: string, id: string, input: Partial<z.infer<typeof ServiceInput>>, actor: AuditActor) {
-  const db = await getDb();
+  const s = await store();
+  const ref = s.services(businessId).doc(id);
+  const current = fromDoc<Service>(await ref.get());
+  if (!current) throw notFound("Service not found");
   const { category, ...rest } = input;
-  const set: Partial<typeof services.$inferInsert> = { ...rest };
-  if (category !== undefined) set.categoryId = await resolveCategory(businessId, "service", category);
-  const [row] = await db
-    .update(services)
-    .set(set)
-    .where(and(eq(services.id, id), eq(services.businessId, businessId)))
-    .returning();
-  if (!row) throw notFound("Service not found");
+  const patch: Partial<Service> = { ...rest, updatedAt: new Date() };
+  if (category !== undefined) patch.categoryId = await resolveCategory(businessId, "service", category);
+  await ref.update(patch);
   await audit(businessId, actor, "service.updated", { type: "service", id }, { fields: Object.keys(input) });
-  return row;
+  return { ...current, ...patch };
 }
 
 export async function deleteService(businessId: string, id: string, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db.delete(services).where(and(eq(services.id, id), eq(services.businessId, businessId))).returning();
-  if (!row) throw notFound("Service not found");
-  await audit(businessId, actor, "service.deleted", { type: "service", id }, { name: row.name });
+  const s = await store();
+  const ref = s.services(businessId).doc(id);
+  const current = fromDoc<Service>(await ref.get());
+  if (!current) throw notFound("Service not found");
+  await ref.delete();
+  await audit(businessId, actor, "service.deleted", { type: "service", id }, { name: current.name });
 }

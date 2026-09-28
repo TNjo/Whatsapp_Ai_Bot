@@ -1,8 +1,8 @@
 import "server-only";
-import { and, asc, desc, eq, gt, ilike, lt, or, type SQL } from "drizzle-orm";
-import { getDb } from "@/db";
-import { conversations, customers, messages, orders, whatsappTemplates } from "@/db/schema";
+import { fromDoc, fromDocs, store } from "@/db";
+import type { Conversation, Customer, Message, WhatsAppTemplate } from "@/db/schema";
 import { getOpenCart, viewCart } from "../commerce/cart";
+import { customerOrders } from "../commerce/orders";
 import { isWindowOpen, loadConversation, markConversationRead, setConversationAI, WINDOW_MS } from "../conversations";
 import { ApiError } from "../http";
 import { deliver } from "../outbound";
@@ -12,89 +12,79 @@ import { audit } from "../audit";
 
 export type InboxFilter = "all" | "human" | "unread" | "active" | "resolved";
 
+const INBOX_WINDOW = 200;
+
+/**
+ * The most recent conversations (one indexed query), with status, unread and
+ * text filters applied in memory — Firestore has no substring search.
+ */
 export async function listConversations(businessId: string, opts: { filter?: InboxFilter; q?: string; includeTest?: boolean; limit?: number } = {}) {
-  const db = await getDb();
-  const where: SQL[] = [eq(conversations.businessId, businessId)];
-  if (!opts.includeTest) where.push(eq(conversations.isTest, false));
-  if (opts.filter === "human") where.push(eq(conversations.status, "human_required"));
-  if (opts.filter === "unread") where.push(gt(conversations.unreadCount, 0));
-  if (opts.filter === "active") where.push(eq(conversations.status, "active"));
-  if (opts.filter === "resolved") where.push(eq(conversations.status, "resolved"));
-  const q = opts.q?.trim();
-  if (q) {
-    where.push(
-      or(
-        ilike(customers.displayName, `%${q}%`),
-        ilike(customers.profileName, `%${q}%`),
-        ilike(customers.phone, `%${q}%`),
-        ilike(conversations.lastMessagePreview, `%${q}%`),
-      )!,
-    );
-  }
-  const rows = await db
-    .select({
-      id: conversations.id,
-      status: conversations.status,
-      aiEnabled: conversations.aiEnabled,
-      unreadCount: conversations.unreadCount,
-      lastMessageAt: conversations.lastMessageAt,
-      lastMessagePreview: conversations.lastMessagePreview,
-      lastInboundAt: conversations.lastInboundAt,
-      handoffReason: conversations.handoffReason,
-      isTest: conversations.isTest,
-      customerId: customers.id,
-      name: customers.displayName,
-      profileName: customers.profileName,
-      phone: customers.phone,
+  const s = await store();
+  let query = s.conversations(businessId).orderBy("lastMessageAt", "desc");
+  if (!opts.includeTest) query = s.conversations(businessId).where("isTest", "==", false).orderBy("lastMessageAt", "desc");
+  const conversations = fromDocs<Conversation>(await query.limit(INBOX_WINDOW).get());
+  const customers = conversations.length ? await s.db.getAll(...conversations.map((c) => s.customers(businessId).doc(c.customerId))) : [];
+  const byId = new Map(customers.map((snap) => [snap.id, fromDoc<Customer>(snap)]));
+  const q = opts.q?.trim().toLowerCase();
+
+  return conversations
+    .map((c) => {
+      const customer = byId.get(c.customerId);
+      const name = customer?.displayName ?? "";
+      const profileName = customer?.profileName ?? "";
+      const phone = customer?.phone ?? "";
+      return {
+        id: c.id,
+        status: c.status,
+        aiEnabled: c.aiEnabled,
+        unreadCount: c.unreadCount,
+        lastMessageAt: c.lastMessageAt,
+        lastMessagePreview: c.lastMessagePreview,
+        lastInboundAt: c.lastInboundAt,
+        handoffReason: c.handoffReason,
+        isTest: c.isTest,
+        customerId: c.customerId,
+        name,
+        profileName,
+        phone,
+        displayName: name || profileName || phone || "Customer",
+        windowOpen: isWindowOpen(c.lastInboundAt),
+      };
     })
-    .from(conversations)
-    .innerJoin(customers, eq(customers.id, conversations.customerId))
-    .where(and(...where))
-    .orderBy(desc(conversations.lastMessageAt))
-    .limit(opts.limit ?? 100);
-  return rows.map((row) => ({
-    ...row,
-    displayName: row.name || row.profileName || row.phone || "Customer",
-    windowOpen: isWindowOpen(row.lastInboundAt),
-  }));
+    .filter((row) => {
+      if (opts.filter === "human" && row.status !== "human_required") return false;
+      if (opts.filter === "unread" && row.unreadCount === 0) return false;
+      if (opts.filter === "active" && row.status !== "active") return false;
+      if (opts.filter === "resolved" && row.status !== "resolved") return false;
+      if (q && !`${row.name} ${row.profileName} ${row.phone} ${row.lastMessagePreview}`.toLowerCase().includes(q)) return false;
+      return true;
+    })
+    .slice(0, opts.limit ?? 100);
 }
 
 export async function conversationMessages(businessId: string, conversationId: string, before?: Date, limit = 60) {
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(messages)
-    .where(and(eq(messages.conversationId, conversationId), eq(messages.businessId, businessId), before ? lt(messages.createdAt, before) : undefined))
-    .orderBy(desc(messages.createdAt))
-    .limit(limit);
-  return rows.reverse();
+  const s = await store();
+  let query = s.messages(businessId, conversationId).orderBy("createdAt", "desc");
+  if (before) query = s.messages(businessId, conversationId).where("createdAt", "<", before).orderBy("createdAt", "desc");
+  return fromDocs<Message>(await query.limit(limit).get()).reverse();
 }
 
 export async function conversationDetail(businessId: string, conversationId: string, { markRead = true } = {}) {
   const { conversation, customer } = await loadConversation(businessId, conversationId);
   if (markRead && conversation.unreadCount) await markConversationRead(businessId, conversationId);
-  const db = await getDb();
+  const s = await store();
   const [thread, recentOrders, cart, templates] = await Promise.all([
     conversationMessages(businessId, conversationId),
-    db
-      .select({ id: orders.id, orderNumber: orders.orderNumber, status: orders.status, total: orders.total, currency: orders.currency, createdAt: orders.createdAt })
-      .from(orders)
-      .where(and(eq(orders.businessId, businessId), eq(orders.customerId, customer.id)))
-      .orderBy(desc(orders.createdAt))
-      .limit(5),
+    customerOrders(businessId, customer.id, 5),
     getOpenCart(businessId, conversationId),
-    db
-      .select({ id: whatsappTemplates.id, name: whatsappTemplates.name, language: whatsappTemplates.language, body: whatsappTemplates.body, variables: whatsappTemplates.variables })
-      .from(whatsappTemplates)
-      .where(and(eq(whatsappTemplates.businessId, businessId), eq(whatsappTemplates.status, "APPROVED")))
-      .orderBy(asc(whatsappTemplates.name)),
+    s.templates(businessId).get().then((snap) => fromDocs<WhatsAppTemplate>(snap)),
   ]);
   const cartView = cart ? await viewCart(businessId, cart) : null;
   return {
     conversation: { ...conversation, unreadCount: 0 },
     customer,
     messages: thread,
-    orders: recentOrders,
+    orders: recentOrders.map(({ id, orderNumber, status, total, currency, createdAt }) => ({ id, orderNumber, status, total, currency, createdAt })),
     draftOrder: cartView
       ? {
           stage: cartView.stage,
@@ -106,7 +96,10 @@ export async function conversationDetail(businessId: string, conversationId: str
       : null,
     windowOpen: await canSendFreeform(businessId, conversation),
     windowClosesAt: conversation.lastInboundAt ? new Date(conversation.lastInboundAt.getTime() + WINDOW_MS) : null,
-    templates,
+    templates: templates
+      .filter((t) => t.status === "APPROVED")
+      .map(({ id, name, language, body, variables }) => ({ id, name, language, body, variables }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
   };
 }
 
@@ -128,11 +121,8 @@ export async function sendManualReply(
   }
 
   if (input.templateId) {
-    const db = await getDb();
-    const [template] = await db
-      .select()
-      .from(whatsappTemplates)
-      .where(and(eq(whatsappTemplates.id, input.templateId), eq(whatsappTemplates.businessId, businessId)));
+    const s = await store();
+    const template = fromDoc<WhatsAppTemplate>(await s.templates(businessId).doc(input.templateId).get());
     if (!template || template.status !== "APPROVED") throw new ApiError(400, "Choose an approved template.");
     const variables = template.variables.map((_, i) => input.variables?.[i] ?? "");
     let preview = template.body;

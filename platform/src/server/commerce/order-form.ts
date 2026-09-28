@@ -1,7 +1,6 @@
 import "server-only";
-import { asc, eq } from "drizzle-orm";
-import { getDb, type DbOrTx } from "@/db";
-import { orderFormFields, orderForms, type OrderFieldType } from "@/db/schema";
+import { fromDoc, isAlreadyExists, newId, store } from "@/db";
+import type { OrderFieldType, OrderForm, OrderFormField } from "@/db/schema";
 
 /** System fields map onto order columns. Product and quantity live on the cart items themselves. */
 export const SYSTEM_FIELDS: {
@@ -21,44 +20,44 @@ export const SYSTEM_FIELDS: {
 
 export const SYSTEM_KEYS = new Set(SYSTEM_FIELDS.map((field) => field.key));
 
-export async function ensureOrderForm(businessId: string, tx?: DbOrTx) {
-  const db = tx ?? (await getDb());
-  const [existing] = await db.select().from(orderForms).where(eq(orderForms.businessId, businessId));
-  if (existing) return existing;
-  const [form] = await db.insert(orderForms).values({ businessId }).onConflictDoNothing().returning();
-  if (!form) {
-    const [raced] = await db.select().from(orderForms).where(eq(orderForms.businessId, businessId));
-    return raced;
-  }
-  await db.insert(orderFormFields).values(
-    SYSTEM_FIELDS.map((field, index) => ({
-      businessId,
-      formId: form.id,
-      key: field.key,
-      label: field.label,
-      type: field.type,
-      required: field.required,
-      enabled: true,
-      system: true,
-      helpText: field.helpText ?? "",
-      sortOrder: index,
-    })),
-  );
-  return form;
+function defaultFields(): OrderFormField[] {
+  return SYSTEM_FIELDS.map((field, index) => ({
+    id: newId(),
+    key: field.key,
+    label: field.label,
+    type: field.type,
+    required: field.required,
+    enabled: true,
+    system: true,
+    options: [],
+    helpText: field.helpText ?? "",
+    sortOrder: index,
+  }));
 }
 
-export type FormField = typeof orderFormFields.$inferSelect;
+/** settings/orderForm holds the whole field list in one document. */
+export async function ensureOrderForm(businessId: string): Promise<OrderForm> {
+  const s = await store();
+  const ref = s.orderForm(businessId);
+  const snap = await ref.get();
+  if (snap.exists) return fromDoc<OrderForm & { id: string }>(snap)!;
+  const form: OrderForm = { name: "Order information", fields: defaultFields(), updatedAt: new Date() };
+  try {
+    await ref.create(form);
+    return form;
+  } catch (err) {
+    if (!isAlreadyExists(err)) throw err;
+    return fromDoc<OrderForm & { id: string }>(await ref.get())!;
+  }
+}
+
+export type FormField = OrderFormField;
 
 /** Enabled fields in display order. */
 export async function getOrderFields(businessId: string, { includeDisabled = false } = {}): Promise<FormField[]> {
-  await ensureOrderForm(businessId);
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(orderFormFields)
-    .where(eq(orderFormFields.businessId, businessId))
-    .orderBy(asc(orderFormFields.sortOrder), asc(orderFormFields.createdAt));
-  return includeDisabled ? rows : rows.filter((row) => row.enabled);
+  const form = await ensureOrderForm(businessId);
+  const fields = [...form.fields].sort((a, b) => a.sortOrder - b.sortOrder);
+  return includeDisabled ? fields : fields.filter((field) => field.enabled);
 }
 
 export function slugKey(label: string): string {

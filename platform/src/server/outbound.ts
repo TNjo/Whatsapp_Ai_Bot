@@ -1,15 +1,13 @@
 import "server-only";
-import { eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { messages, type MessagePayload, type MessageSender, type MessageType } from "@/db/schema";
-import { insertOutboundRecord, isWindowOpen, loadConversation } from "./conversations";
+import { store } from "@/db";
+import type { MessagePayload, MessageSender, MessageType } from "@/db/schema";
+import { insertOutboundRecord, isWindowOpen, loadConversation, recordWaMessageId } from "./conversations";
 import { publish } from "./events";
 import { log } from "./logger";
 import { notify } from "./notifications";
 import { getChannel } from "./whatsapp/channel";
 import { GraphError } from "./whatsapp/graph";
 import { toPlainText, type OutboundMessage } from "./whatsapp/messaging";
-import { WebLinkError } from "./whatsapp/web";
 
 export type DeliveryResult =
   | { ok: true; messageId: string; simulated: boolean }
@@ -63,13 +61,14 @@ export async function deliver(input: {
     payload: { ...shape.payload, ...input.extraPayload },
     sentByUserId: input.userId,
   });
-  const db = await getDb();
+  const s = await store();
 
   const finish = async (status: "sent" | "failed", extra: { waMessageId?: string; errorMessage?: string } = {}) => {
-    await db
-      .update(messages)
-      .set({ status, statusUpdatedAt: new Date(), waMessageId: extra.waMessageId ?? null, errorMessage: extra.errorMessage ?? null })
-      .where(eq(messages.id, record.id));
+    await s
+      .messages(businessId, conversationId)
+      .doc(record.id)
+      .update({ status, statusUpdatedAt: new Date(), waMessageId: extra.waMessageId ?? null, errorMessage: extra.errorMessage ?? null });
+    if (extra.waMessageId) await recordWaMessageId(businessId, conversationId, record.id, extra.waMessageId);
     publish(businessId, { type: "message.created", conversationId, messageId: record.id, direction: "outbound" });
     publish(businessId, { type: "conversation.updated", conversationId });
   };
@@ -106,8 +105,7 @@ export async function deliver(input: {
     });
     return { ok: true, messageId: record.id, simulated: false };
   } catch (err) {
-    const error =
-      err instanceof GraphError ? err.friendly : err instanceof WebLinkError ? err.message : "Unable to send the message. Please try again.";
+    const error = err instanceof GraphError ? err.friendly : "Unable to send the message. Please try again.";
     await finish("failed", { errorMessage: error });
     log.error("whatsapp.send.failed", { businessId, conversationId, kind: message.kind, code: err instanceof GraphError ? err.code : undefined, err });
     await notify(businessId, {

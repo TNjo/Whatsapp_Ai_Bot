@@ -127,7 +127,7 @@ export default async function OrderPage(props: PageProps<"/dashboard/orders/[id]
                 </Info>
               ) : null}
               {customFields.map((field) => (
-                <Info key={field.id} icon={FileText} label={field.label}>
+                <Info key={field.key} icon={FileText} label={field.label}>
                   {field.value}
                 </Info>
               ))}

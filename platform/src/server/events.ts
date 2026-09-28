@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 
 /**
  * Real-time events pushed to the dashboard over Server-Sent Events.
- * In-process bus: one Node server instance. Swap for Postgres LISTEN/NOTIFY
+ * In-process bus: one Node server instance. Swap for Firestore listeners, Pub/Sub
  * or Redis pub/sub when running several instances.
  */
 export type RealtimeEvent =

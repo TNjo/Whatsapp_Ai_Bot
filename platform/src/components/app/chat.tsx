@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 
 export type ChatMessage = {
   id: string;
+  conversationId: string;
   direction: "inbound" | "outbound";
   sender: "customer" | "ai" | "agent" | "system";
   type: string;
@@ -68,7 +69,7 @@ export function MessageBubble({ message, timeZone, showSender = true }: { messag
   const label = !inbound && showSender ? SENDER_LABEL[message.sender as keyof typeof SENDER_LABEL] : null;
   const media = message.payload.media;
   const interactive = message.payload.interactive;
-  const imageSrc = inbound ? (media?.id ? `/api/media/${message.id}` : null) : (media?.link ?? null);
+  const imageSrc = inbound ? (media?.id ? `/api/media/${message.conversationId}/${message.id}` : null) : (media?.link ?? null);
   const time = new Date(message.createdAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone });
 
   return (
@@ -96,7 +97,7 @@ export function MessageBubble({ message, timeZone, showSender = true }: { messag
         ) : null}
         {message.type === "document" ? (
           <a
-            href={inbound ? `/api/media/${message.id}` : (media?.link ?? "#")}
+            href={inbound ? `/api/media/${message.conversationId}/${message.id}` : (media?.link ?? "#")}
             target="_blank"
             rel="noreferrer"
             className="mb-1 flex items-center gap-2 rounded-lg bg-background/60 px-2.5 py-2 text-xs font-medium hover:underline"
@@ -106,7 +107,7 @@ export function MessageBubble({ message, timeZone, showSender = true }: { messag
         ) : null}
         {message.type === "audio" ? (
           inbound && media?.id ? (
-            <audio controls src={`/api/media/${message.id}`} className="mb-1 h-9 max-w-full" />
+            <audio controls src={`/api/media/${message.conversationId}/${message.id}`} className="mb-1 h-9 max-w-full" />
           ) : (
             <span className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
               <Mic className="size-3.5" /> Voice message

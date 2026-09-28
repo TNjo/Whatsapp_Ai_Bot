@@ -1,7 +1,6 @@
 import "server-only";
-import { getDb } from "@/db";
-import { conversations, messages } from "@/db/schema";
-import { and, desc, eq } from "drizzle-orm";
+import { fromDocs, store } from "@/db";
+import type { Message } from "@/db/schema";
 import {
   getOrCreateConversation,
   loadConversation,
@@ -40,8 +39,6 @@ function serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
 export type IncomingInput = {
   businessId: string;
   waId: string;
-  /** Linked-device chat id to reply to ("…@c.us" / "…@lid"). */
-  waChatId?: string;
   profileName?: string;
   message: InboundInput;
   isTest?: boolean;
@@ -55,7 +52,6 @@ export async function handleIncoming(input: IncomingInput) {
   const { businessId } = input;
   const { customer, created: newCustomer } = await upsertCustomer(businessId, {
     waId: input.waId,
-    waChatId: input.waChatId,
     profileName: input.profileName,
     isTest: input.isTest,
   });
@@ -103,10 +99,8 @@ async function respond(args: {
   isTest: boolean;
 }) {
   const { businessId, conversationId, inbound } = args;
-  const db = await getDb();
   const bot = await loadBotContext(businessId);
-  const [conversation] = await db.select().from(conversations).where(eq(conversations.id, conversationId));
-  const { customer } = await loadConversation(businessId, conversationId);
+  const { conversation, customer } = await loadConversation(businessId, conversationId);
 
   // AI off (globally, for this chat, or waiting for a human): store only, and tell the team.
   if (!bot.settings.aiEnabled || !conversation.aiEnabled || conversation.status === "human_required") {
@@ -171,7 +165,7 @@ async function handleReplyId(
         // The draft changed after the review: show the up-to-date summary instead of placing a stale order.
         const view = await viewCart(rt.businessId, cart);
         if (!view.readyForReview) return false; // let the AI ask for what's missing
-        await markReviewSent(cart.id, view.reviewHash);
+        await markReviewSent(rt.businessId, cart.id, view.reviewHash);
         const labels = new Map(rt.bot.orderFields.map((field) => [field.key, field.label]));
         await send(
           [
@@ -198,7 +192,7 @@ async function handleReplyId(
     await send([{ kind: "text", text: "No problem — your order has been cancelled. Let me know if there's anything else I can help with." }], "system");
     return true;
   }
-  const view = /^(?:view_)?product:([0-9a-f-]{36})$/.exec(replyId);
+  const view = /^(?:view_)?product:([A-Za-z0-9_-]{1,128})$/.exec(replyId);
   if (view) {
     const card = await productCard(rt, view[1]);
     if (!card) return false;
@@ -212,7 +206,7 @@ async function handleReplyId(
 /** Adds the product behind a tapped button to the stored text so the model (and the inbox) know what was chosen. */
 async function enrichReply(businessId: string, message: InboundInput): Promise<InboundInput> {
   const replyId = message.payload?.interactive?.replyId;
-  const match = replyId ? /^(?:order_|view_)?product:([0-9a-f-]{36})$/.exec(replyId) : null;
+  const match = replyId ? /^(?:order_|view_)?product:([A-Za-z0-9_-]{1,128})$/.exec(replyId) : null;
   if (!match) return message;
   const found = await getProduct(businessId, match[1]);
   if (!found) return message;
@@ -221,7 +215,7 @@ async function enrichReply(businessId: string, message: InboundInput): Promise<I
 }
 
 /**
- * Where buttons can't be shown (linked devices, or the Cloud API's text fallback),
+ * Where buttons can't be shown (the Cloud API's plain-text fallback),
  * options are sent as a numbered list. A reply of "1" or the option's title is
  * treated exactly like tapping that button.
  */
@@ -229,13 +223,9 @@ async function resolveTextChoice(businessId: string, conversationId: string, mes
   if (message.type !== "text" || message.payload?.interactive) return message;
   const text = message.content.trim().replace(/[.)!]+$/, "").toLowerCase();
   if (!text || text.length > 40) return message;
-  const db = await getDb();
-  const [last] = await db
-    .select({ payload: messages.payload })
-    .from(messages)
-    .where(and(eq(messages.conversationId, conversationId), eq(messages.businessId, businessId), eq(messages.direction, "outbound")))
-    .orderBy(desc(messages.createdAt))
-    .limit(1);
+  const s = await store();
+  const recent = fromDocs<Message>(await s.messages(businessId, conversationId).orderBy("createdAt", "desc").limit(10).get());
+  const last = recent.find((m) => m.direction === "outbound");
   const interactive = last?.payload.interactive;
   const options =
     interactive?.kind === "buttons"

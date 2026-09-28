@@ -1,11 +1,11 @@
 import "server-only";
-import { and, count, desc, eq, gte, inArray, sql } from "drizzle-orm";
-import { getDb } from "@/db";
-import { botSettings, conversations, customers, orderItems, orders, products, services, whatsappConnections } from "@/db/schema";
+import { fromDoc, fromDocs, store } from "@/db";
+import type { BotSettings, Conversation, Customer, Order, WhatsAppConnection } from "@/db/schema";
 import { REVENUE_STATUSES } from "@/lib/order-status";
 import { resolveAIConfig } from "../ai/service";
 import { WINDOW_MS } from "../conversations";
 import { listNotifications } from "../queries/shell";
+import { statusCounts } from "./orders";
 
 /** The UTC instant of today's local midnight in a timezone. */
 export function startOfDay(timeZone: string, now = new Date()) {
@@ -29,106 +29,77 @@ export function startOfDay(timeZone: string, now = new Date()) {
 }
 
 export async function dashboardData(businessId: string, timeZone: string) {
-  const db = await getDb();
+  const s = await store();
   const today = startOfDay(timeZone);
-  const real = and(eq(orders.businessId, businessId), eq(orders.isTest, false));
+  const real = s.orders(businessId).where("isTest", "==", false);
 
-  const [
-    [todayOrders],
-    statusRows,
-    [todayRevenue],
-    [customerCount],
-    [activeConversations],
-    pending,
-    recent,
-    handoffs,
-    notificationsList,
-    [connection],
-    [settings],
-    [productCount],
-    [serviceCount],
-    [testChats],
-  ] = await Promise.all([
-    db.select({ n: count() }).from(orders).where(and(real, gte(orders.createdAt, today))),
-    db.select({ status: orders.status, n: count() }).from(orders).where(real).groupBy(orders.status),
-    db
-      .select({ sum: sql<number>`coalesce(sum(${orders.total}), 0)::int` })
-      .from(orders)
-      .where(and(real, gte(orders.createdAt, today), inArray(orders.status, REVENUE_STATUSES))),
-    db.select({ n: count() }).from(customers).where(and(eq(customers.businessId, businessId), eq(customers.isTest, false))),
-    db
-      .select({ n: count() })
-      .from(conversations)
-      .where(
-        and(
-          eq(conversations.businessId, businessId),
-          eq(conversations.isTest, false),
-          sql`${conversations.status} <> 'resolved'`,
-          gte(conversations.lastMessageAt, new Date(Date.now() - WINDOW_MS)),
-        ),
-      ),
-    db
-      .select({ order: orders, customerName: customers.displayName, profileName: customers.profileName })
-      .from(orders)
-      .innerJoin(customers, eq(customers.id, orders.customerId))
-      .where(and(real, eq(orders.status, "PENDING")))
-      .orderBy(desc(orders.createdAt))
-      .limit(6),
-    db
-      .select({ order: orders, customerName: customers.displayName, profileName: customers.profileName })
-      .from(orders)
-      .innerJoin(customers, eq(customers.id, orders.customerId))
-      .where(real)
-      .orderBy(desc(orders.createdAt))
-      .limit(8),
-    db
-      .select({ id: conversations.id, reason: conversations.handoffReason, lastMessageAt: conversations.lastMessageAt, name: customers.displayName, profileName: customers.profileName, phone: customers.phone })
-      .from(conversations)
-      .innerJoin(customers, eq(customers.id, conversations.customerId))
-      .where(and(eq(conversations.businessId, businessId), eq(conversations.status, "human_required"), eq(conversations.isTest, false)))
-      .orderBy(desc(conversations.lastMessageAt))
-      .limit(5),
-    listNotifications(businessId, 8),
-    db.select().from(whatsappConnections).where(eq(whatsappConnections.businessId, businessId)),
-    db.select().from(botSettings).where(eq(botSettings.businessId, businessId)),
-    db.select({ n: count() }).from(products).where(eq(products.businessId, businessId)),
-    db.select({ n: count() }).from(services).where(eq(services.businessId, businessId)),
-    db
-      .select({ n: count() })
-      .from(conversations)
-      .where(and(eq(conversations.businessId, businessId), eq(conversations.isTest, true), sql`${conversations.lastMessagePreview} <> ''`)),
-  ]);
+  const [todayOrders, counts, customerCount, recentConversations, pending, recent, handoffRows, notificationsList, connection, settings, productCount, serviceCount, testChats] =
+    await Promise.all([
+      real.where("createdAt", ">=", today).orderBy("createdAt", "desc").get().then((snap) => fromDocs<Order>(snap)),
+      statusCounts(businessId),
+      s.customers(businessId).where("isTest", "==", false).count().get(),
+      s.conversations(businessId)
+        .where("isTest", "==", false)
+        .where("lastMessageAt", ">=", new Date(Date.now() - WINDOW_MS))
+        .orderBy("lastMessageAt", "desc")
+        .limit(500)
+        .get()
+        .then((snap) => fromDocs<Conversation>(snap)),
+      real.where("status", "==", "PENDING").orderBy("createdAt", "desc").limit(6).get().then((snap) => fromDocs<Order>(snap)),
+      real.orderBy("createdAt", "desc").limit(8).get().then((snap) => fromDocs<Order>(snap)),
+      s.conversations(businessId)
+        .where("status", "==", "human_required")
+        .where("isTest", "==", false)
+        .get()
+        .then((snap) => fromDocs<Conversation>(snap)),
+      listNotifications(businessId, 8),
+      s.whatsapp(businessId).get().then((snap) => fromDoc<WhatsAppConnection & { id: string }>(snap)),
+      s.bot(businessId).get().then((snap) => fromDoc<BotSettings & { id: string }>(snap)),
+      s.products(businessId).count().get(),
+      s.services(businessId).count().get(),
+      s.conversations(businessId).where("isTest", "==", true).get().then((snap) => fromDocs<Conversation>(snap)),
+    ]);
 
-  const pendingIds = pending.map((p) => p.order.id);
-  const pendingItems = pendingIds.length
-    ? await db.select({ orderId: orderItems.orderId, name: orderItems.name, quantity: orderItems.quantity }).from(orderItems).where(inArray(orderItems.orderId, pendingIds))
-    : [];
-  const byStatus = Object.fromEntries(statusRows.map((r) => [r.status, r.n])) as Record<string, number>;
+  const handoffs = handoffRows.sort((a, b) => b.lastMessageAt.getTime() - a.lastMessageAt.getTime()).slice(0, 5);
+  const customerIds = [...new Set([...pending, ...recent].map((o) => o.customerId).concat(handoffs.map((h) => h.customerId)))];
+  const customerSnaps = customerIds.length ? await s.db.getAll(...customerIds.map((id) => s.customers(businessId).doc(id))) : [];
+  const customers = new Map(customerSnaps.map((snap) => [snap.id, fromDoc<Customer>(snap)]));
+  const nameOf = (order: Order) => {
+    const c = customers.get(order.customerId);
+    return order.customerName || c?.displayName || c?.profileName || order.customerPhone;
+  };
 
   const setup = [
     { key: "whatsapp", label: "Connect WhatsApp", done: connection?.status === "connected", href: "/dashboard/whatsapp" },
     { key: "ai", label: "Add an AI key and review bot settings", done: Boolean(settings && resolveAIConfig(settings)), href: "/dashboard/bot" },
-    { key: "catalog", label: "Add products or services", done: (productCount?.n ?? 0) + (serviceCount?.n ?? 0) > 0, href: "/dashboard/products" },
-    { key: "test", label: "Try the bot in Test mode", done: (testChats?.n ?? 0) > 0, href: "/dashboard/bot/test" },
+    { key: "catalog", label: "Add products or services", done: productCount.data().count + serviceCount.data().count > 0, href: "/dashboard/products" },
+    { key: "test", label: "Try the bot in Test mode", done: testChats.some((c) => c.lastMessagePreview), href: "/dashboard/bot/test" },
   ];
 
   return {
     stats: {
-      todayOrders: todayOrders?.n ?? 0,
-      pending: byStatus.PENDING ?? 0,
-      confirmed: (byStatus.CONFIRMED ?? 0) + (byStatus.PROCESSING ?? 0) + (byStatus.READY ?? 0) + (byStatus.DISPATCHED ?? 0),
-      completed: (byStatus.COMPLETED ?? 0) + (byStatus.DELIVERED ?? 0),
-      todayRevenue: todayRevenue?.sum ?? 0,
-      customers: customerCount?.n ?? 0,
-      activeConversations: activeConversations?.n ?? 0,
+      todayOrders: todayOrders.length,
+      pending: counts.PENDING,
+      confirmed: counts.CONFIRMED + counts.PROCESSING + counts.READY + counts.DISPATCHED,
+      completed: counts.COMPLETED + counts.DELIVERED,
+      todayRevenue: todayOrders.filter((o) => REVENUE_STATUSES.includes(o.status)).reduce((sum, o) => sum + o.total, 0),
+      customers: customerCount.data().count,
+      activeConversations: recentConversations.filter((c) => c.status !== "resolved").length,
     },
-    pending: pending.map(({ order, customerName, profileName }) => ({
-      ...order,
-      displayName: order.customerName || customerName || profileName || order.customerPhone,
-      items: pendingItems.filter((i) => i.orderId === order.id),
-    })),
-    recent: recent.map(({ order, customerName, profileName }) => ({ ...order, displayName: order.customerName || customerName || profileName || order.customerPhone })),
-    handoffs: handoffs.map((h) => ({ ...h, displayName: h.name || h.profileName || h.phone })),
+    pending: pending.map((order) => ({ ...order, displayName: nameOf(order), items: order.items.map(({ name, quantity }) => ({ name, quantity })) })),
+    recent: recent.map((order) => ({ ...order, displayName: nameOf(order) })),
+    handoffs: handoffs.map((h) => {
+      const c = customers.get(h.customerId);
+      return {
+        id: h.id,
+        reason: h.handoffReason,
+        lastMessageAt: h.lastMessageAt,
+        name: c?.displayName ?? "",
+        profileName: c?.profileName ?? "",
+        phone: c?.phone ?? "",
+        displayName: c?.displayName || c?.profileName || c?.phone || "Customer",
+      };
+    }),
     notifications: notificationsList,
     whatsapp: { status: connection?.status ?? "disconnected" },
     setup: setup.every((step) => step.done) ? null : setup,

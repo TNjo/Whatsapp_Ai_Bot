@@ -1,83 +1,80 @@
 import "server-only";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { getDb, type Tx } from "@/db";
-import {
-  botSettings,
-  businesses,
-  carts,
-  conversations,
-  customers,
-  orderCustomFields,
-  orderItems,
-  orders,
-  orderStatusHistory,
-  products,
-  productVariants,
-  whatsappTemplates,
-} from "@/db/schema";
+import type { Transaction } from "firebase-admin/firestore";
+import { fromDoc, fromDocs, newId, store } from "@/db";
+import type { BotSettings, Business, Conversation, Customer, Order, OrderItem, OrderStatusChange, Product, WhatsAppTemplate } from "@/db/schema";
 import { formatMoney } from "@/lib/format";
 import { REVENUE_STATUSES, STATUS_LABEL, STATUS_TRANSITIONS, STOCK_RELEASING, type OrderStatus } from "@/lib/order-status";
 import { audit, type AuditActor } from "../audit";
-import { canSendFreeform } from "../whatsapp/channel";
 import { publish } from "../events";
 import { ApiError, notFound } from "../http";
 import { log } from "../logger";
 import { notify } from "../notifications";
 import { deliver } from "../outbound";
+import { canSendFreeform } from "../whatsapp/channel";
 import { viewCart, type Cart, type CartView } from "./cart";
 import { getOrderFields, SYSTEM_KEYS } from "./order-form";
 import { DEFAULT_STATUS_MESSAGES, renderMessage, statusMessageKey, type MessageVars } from "./status-messages";
 
-export type Order = typeof orders.$inferSelect;
+export type { Order };
 
 export class OrderError extends Error {}
 
 /** Recomputes the stored totals on the customer record (spec §9). Test orders don't count. */
-export async function refreshCustomerStats(customerId: string, tx?: Tx) {
-  const db = tx ?? (await getDb());
-  const [stats] = await db
-    .select({
-      count: sql<number>`count(*)::int`,
-      spent: sql<number>`coalesce(sum(case when ${inArray(orders.status, REVENUE_STATUSES)} then ${orders.total} else 0 end), 0)::int`,
+export async function refreshCustomerStats(businessId: string, customerId: string) {
+  const s = await store();
+  const rows = fromDocs<Order>(await s.orders(businessId).where("customerId", "==", customerId).get()).filter((o) => !o.isTest);
+  await s
+    .customers(businessId)
+    .doc(customerId)
+    .update({
+      totalOrders: rows.length,
+      totalSpent: rows.filter((o) => REVENUE_STATUSES.includes(o.status)).reduce((sum, o) => sum + o.total, 0),
+      updatedAt: new Date(),
     })
-    .from(orders)
-    .where(and(eq(orders.customerId, customerId), eq(orders.isTest, false)));
-  await db
-    .update(customers)
-    .set({ totalOrders: stats?.count ?? 0, totalSpent: stats?.spent ?? 0 })
-    .where(eq(customers.id, customerId));
+    .catch(() => undefined);
 }
 
-async function adjustStock(tx: Tx, items: { productId: string | null; variantId: string | null; quantity: number }[], direction: -1 | 1) {
-  const lowStock: { productId: string; stock: number }[] = [];
-  for (const item of items) {
-    if (!item.productId) continue;
-    const [product] = await tx.select().from(products).where(eq(products.id, item.productId));
-    if (!product?.trackStock) continue;
-    const delta = direction * item.quantity;
-    if (item.variantId) {
-      const [variant] = await tx
-        .update(productVariants)
-        .set({ stock: sql`${productVariants.stock} + ${delta}` })
-        .where(and(eq(productVariants.id, item.variantId), direction < 0 ? sql`${productVariants.stock} >= ${item.quantity}` : undefined))
-        .returning();
-      if (!variant) throw new OrderError(`Sorry, ${product.name} is now out of stock in that option.`);
-      await tx
-        .update(products)
-        .set({ stock: sql`(select coalesce(sum(stock), 0) from product_variants where product_id = ${product.id})` })
-        .where(eq(products.id, product.id));
-      lowStock.push({ productId: product.id, stock: variant.stock });
+type StockLine = { productId: string | null; variantId: string | null; quantity: number };
+
+/**
+ * Reads the products for a stock change inside a transaction (Firestore needs all
+ * reads before writes), returns the writes to apply and the resulting stock levels.
+ */
+async function planStock(tx: Transaction, businessId: string, lines: StockLine[], direction: -1 | 1) {
+  const s = await store();
+  const ids = [...new Set(lines.map((l) => l.productId).filter((id): id is string => Boolean(id)))];
+  const snaps = ids.length ? await tx.getAll(...ids.map((id) => s.products(businessId).doc(id))) : [];
+  const products = new Map(snaps.map((snap) => [snap.id, fromDoc<Product>(snap)]));
+  const changed = new Map<string, Product>();
+  const levels: { productId: string; name: string; stock: number }[] = [];
+
+  for (const line of lines) {
+    if (!line.productId) continue;
+    const product = changed.get(line.productId) ?? products.get(line.productId);
+    if (!product || !product.trackStock) continue;
+    const delta = direction * line.quantity;
+    let next: Product;
+    if (line.variantId) {
+      const variant = product.variants.find((v) => v.id === line.variantId);
+      if (!variant || (direction < 0 && variant.stock < line.quantity)) {
+        throw new OrderError(`Sorry, ${product.name} is now out of stock in that option.`);
+      }
+      const variants = product.variants.map((v) => (v.id === line.variantId ? { ...v, stock: v.stock + delta } : v));
+      next = { ...product, variants, stock: variants.reduce((sum, v) => sum + v.stock, 0) };
+      levels.push({ productId: product.id, name: product.name, stock: variant.stock + delta });
     } else {
-      const [updated] = await tx
-        .update(products)
-        .set({ stock: sql`${products.stock} + ${delta}` })
-        .where(and(eq(products.id, product.id), direction < 0 ? sql`${products.stock} >= ${item.quantity}` : undefined))
-        .returning();
-      if (!updated) throw new OrderError(`Sorry, ${product.name} is now out of stock.`);
-      lowStock.push({ productId: product.id, stock: updated.stock });
+      if (direction < 0 && product.stock < line.quantity) throw new OrderError(`Sorry, ${product.name} is now out of stock.`);
+      next = { ...product, stock: product.stock + delta };
+      levels.push({ productId: product.id, name: product.name, stock: next.stock });
     }
+    changed.set(product.id, next);
   }
-  return lowStock;
+  const apply = () => {
+    for (const product of changed.values()) {
+      tx.update(s.products(businessId).doc(product.id), { variants: product.variants, stock: product.stock, updatedAt: new Date() });
+    }
+  };
+  return { apply, levels };
 }
 
 /**
@@ -91,96 +88,100 @@ export async function createOrderFromCart(businessId: string, cart: Cart, opts: 
     throw new OrderError("The order changed since the customer reviewed it. Show the review again before confirming.");
   }
 
-  const db = await getDb();
+  const s = await store();
   const fieldDefs = await getOrderFields(businessId);
   const labels = new Map(fieldDefs.map((field) => [field.key, field.label]));
   const f = view.fields;
+  const orderId = newId();
 
-  const result = await db.transaction(async (tx) => {
-    // Test orders never consume the real ORD- sequence.
-    const [business] = await tx
-      .update(businesses)
-      .set({ nextOrderNumber: opts.isTest ? businesses.nextOrderNumber : sql`${businesses.nextOrderNumber} + 1` })
-      .where(eq(businesses.id, businessId))
-      .returning({ next: businesses.nextOrderNumber, currency: businesses.currency, lowStockThreshold: businesses.lowStockThreshold });
-    const orderNumber = opts.isTest
-      ? `TEST-${Math.floor(10000 + Math.random() * 90000)}`
-      : `ORD-${business.next - 1}`;
-
-    const lowStock = opts.isTest
-      ? []
-      : await adjustStock(
+  const { order, lowStock } = await s.db.runTransaction(async (tx) => {
+    const businessRef = s.businesses.doc(businessId);
+    const cartRef = s.carts(businessId).doc(cart.id);
+    const [businessSnap, cartSnap] = await tx.getAll(businessRef, cartRef);
+    const business = fromDoc<Business>(businessSnap)!;
+    if (!cartSnap.exists) throw new OrderError("The order was already placed or cancelled.");
+    const stock = opts.isTest
+      ? { apply: () => undefined, levels: [] }
+      : await planStock(
           tx,
+          businessId,
           view.items.map((item) => ({ productId: item.kind === "product" ? item.refId : null, variantId: item.variantId, quantity: item.quantity })),
           -1,
         );
 
-    const [order] = await tx
-      .insert(orders)
-      .values({
-        businessId,
-        orderNumber,
-        customerId: cart.customerId,
-        conversationId: cart.conversationId,
-        status: "PENDING",
-        currency: business.currency,
-        subtotal: view.subtotal,
-        deliveryFee: view.deliveryFee,
-        total: view.total,
-        customerName: f.name ?? "",
-        customerPhone: f.phone ?? "",
-        deliveryAddress: f.address ?? "",
-        city: f.city ?? "",
-        paymentMethod: f.payment_method ?? "",
-        customerNote: f.note ?? "",
-        isTest: opts.isTest,
-      })
-      .returning();
-
-    await tx.insert(orderItems).values(
-      view.items.map((item) => ({
-        businessId,
-        orderId: order.id,
-        productId: item.kind === "product" ? item.refId : null,
-        serviceId: item.kind === "service" ? item.refId : null,
-        variantId: item.variantId,
-        name: item.name,
-        optionValues: item.options,
-        unitPrice: item.unitPrice,
-        quantity: item.quantity,
-        lineTotal: item.lineTotal,
-      })),
-    );
-    const custom = Object.entries(f).filter(([key, value]) => !SYSTEM_KEYS.has(key) && value);
-    if (custom.length) {
-      await tx.insert(orderCustomFields).values(
-        custom.map(([key, value]) => ({ businessId, orderId: order.id, key, label: labels.get(key) ?? key, value })),
-      );
-    }
-    await tx.insert(orderStatusHistory).values({
+    // Test orders never consume the real ORD- sequence.
+    const orderNumber = opts.isTest ? `TEST-${Math.floor(10000 + Math.random() * 90000)}` : `ORD-${business.nextOrderNumber}`;
+    const now = new Date();
+    const items: OrderItem[] = view.items.map((item) => ({
+      id: newId(),
+      productId: item.kind === "product" ? item.refId : null,
+      serviceId: item.kind === "service" ? item.refId : null,
+      variantId: item.variantId,
+      name: item.name,
+      optionValues: item.options,
+      unitPrice: item.unitPrice,
+      quantity: item.quantity,
+      lineTotal: item.lineTotal,
+    }));
+    const created: Order = {
+      id: orderId,
       businessId,
-      orderId: order.id,
-      fromStatus: null,
-      toStatus: "PENDING",
-      changedBy: "Customer (WhatsApp)",
-      note: "Order placed after customer confirmation",
-    });
-    await tx.update(carts).set({ status: "converted", orderId: order.id }).where(eq(carts.id, cart.id));
+      orderNumber,
+      customerId: cart.customerId,
+      conversationId: cart.conversationId,
+      status: "PENDING",
+      currency: business.currency,
+      subtotal: view.subtotal,
+      deliveryFee: view.deliveryFee,
+      discount: 0,
+      total: view.total,
+      customerName: f.name ?? "",
+      customerPhone: f.phone ?? "",
+      deliveryAddress: f.address ?? "",
+      city: f.city ?? "",
+      paymentMethod: f.payment_method ?? "",
+      customerNote: f.note ?? "",
+      internalNotes: "",
+      trackingNumber: "",
+      isTest: opts.isTest,
+      items,
+      customFields: Object.entries(f)
+        .filter(([key, value]) => !SYSTEM_KEYS.has(key) && value)
+        .map(([key, value]) => ({ key, label: labels.get(key) ?? key, value })),
+      history: [
+        {
+          id: newId(),
+          fromStatus: null,
+          toStatus: "PENDING",
+          changedByUserId: null,
+          changedBy: "Customer (WhatsApp)",
+          note: "Order placed after customer confirmation",
+          notification: "skipped",
+          createdAt: now,
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    };
 
+    // Writes (after every read).
+    stock.apply();
+    if (!opts.isTest) tx.update(businessRef, { nextOrderNumber: business.nextOrderNumber + 1, updatedAt: now });
+    const { id: _id, ...doc } = created;
+    void _id;
+    tx.create(s.orders(businessId).doc(orderId), doc);
+    tx.delete(cartRef);
     // Remember delivery details for next time.
-    await tx
-      .update(customers)
-      .set({
-        ...(f.name ? { displayName: f.name } : {}),
-        ...(f.address ? { address: f.address } : {}),
-        ...(f.city ? { city: f.city } : {}),
-      })
-      .where(eq(customers.id, cart.customerId));
-    await refreshCustomerStats(cart.customerId, tx);
-    return { order, lowStock: lowStock.filter((item) => item.stock <= business.lowStockThreshold) };
+    tx.update(s.customers(businessId).doc(cart.customerId), {
+      ...(f.name ? { displayName: f.name } : {}),
+      ...(f.address ? { address: f.address } : {}),
+      ...(f.city ? { city: f.city } : {}),
+      updatedAt: now,
+    });
+    return { order: created, lowStock: stock.levels.filter((item) => item.stock <= business.lowStockThreshold) };
   });
 
-  const { order } = result;
+  await refreshCustomerStats(businessId, cart.customerId);
   log.info("order.created", { businessId, orderId: order.id, orderNumber: order.orderNumber, total: order.total, isTest: order.isTest });
   await audit(businessId, { name: "customer" }, "order.created", { type: "order", id: order.id }, { orderNumber: order.orderNumber, total: order.total });
   publish(businessId, { type: "order.created", orderId: order.id, orderNumber: order.orderNumber, total: order.total, currency: order.currency, isTest: order.isTest });
@@ -191,11 +192,10 @@ export async function createOrderFromCart(businessId: string, cart: Cart, opts: 
       body: `${order.customerName || "Customer"} · ${formatMoney(order.total, order.currency)}`,
       link: `/dashboard/orders/${order.id}`,
     });
-    for (const item of result.lowStock) {
-      const [product] = await db.select({ name: products.name }).from(products).where(eq(products.id, item.productId));
+    for (const item of lowStock) {
       await notify(businessId, {
         type: "low_stock",
-        title: item.stock <= 0 ? `${product?.name} is out of stock` : `${product?.name} is running low`,
+        title: item.stock <= 0 ? `${item.name} is out of stock` : `${item.name} is running low`,
         body: `${item.stock} left`,
         link: `/dashboard/products/${item.productId}`,
       });
@@ -205,8 +205,8 @@ export async function createOrderFromCart(businessId: string, cart: Cart, opts: 
 }
 
 export async function getOrderForBusiness(businessId: string, orderId: string) {
-  const db = await getDb();
-  const [order] = await db.select().from(orders).where(and(eq(orders.id, orderId), eq(orders.businessId, businessId)));
+  const s = await store();
+  const order = fromDoc<Order>(await s.orders(businessId).doc(orderId).get());
   if (!order) throw notFound("Order not found");
   return order;
 }
@@ -220,11 +220,17 @@ type NotifyResult = { notification: "sent" | "template" | "failed" | "skipped"; 
 async function notifyCustomer(order: Order, status: OrderStatus): Promise<NotifyResult> {
   const key = statusMessageKey(status);
   if (!key || !order.conversationId) return { notification: "skipped" };
-  const db = await getDb();
-  const [conversation] = await db.select().from(conversations).where(eq(conversations.id, order.conversationId));
-  const [customer] = await db.select().from(customers).where(eq(customers.id, order.customerId));
-  const [business] = await db.select().from(businesses).where(eq(businesses.id, order.businessId));
-  const [settings] = await db.select().from(botSettings).where(eq(botSettings.businessId, order.businessId));
+  const s = await store();
+  const [conversationSnap, customerSnap, businessSnap, settingsSnap] = await s.db.getAll(
+    s.conversations(order.businessId).doc(order.conversationId),
+    s.customers(order.businessId).doc(order.customerId),
+    s.businesses.doc(order.businessId),
+    s.bot(order.businessId),
+  );
+  const conversation = fromDoc<Conversation>(conversationSnap);
+  const customer = fromDoc<Customer>(customerSnap);
+  const business = fromDoc<Business>(businessSnap)!;
+  const settings = fromDoc<BotSettings & { id: string }>(settingsSnap);
   if (!conversation || !customer) return { notification: "skipped" };
 
   const vars: MessageVars = {
@@ -238,21 +244,14 @@ async function notifyCustomer(order: Order, status: OrderStatus): Promise<Notify
   const body = renderMessage(settings?.statusMessages?.[key] || DEFAULT_STATUS_MESSAGES[key], vars);
 
   if (await canSendFreeform(order.businessId, conversation)) {
-    const result = await deliver({
-      businessId: order.businessId,
-      conversationId: conversation.id,
-      message: { kind: "text", text: body },
-      sender: "system",
-    });
+    const result = await deliver({ businessId: order.businessId, conversationId: conversation.id, message: { kind: "text", text: body }, sender: "system" });
     if (result.ok) return { notification: "sent" };
     if (result.reason !== "window_closed") return { notification: "failed", detail: result.error };
   }
 
-  const [template] = await db
-    .select()
-    .from(whatsappTemplates)
-    .where(and(eq(whatsappTemplates.businessId, order.businessId), eq(whatsappTemplates.purpose, key), eq(whatsappTemplates.status, "APPROVED")))
-    .limit(1);
+  const [template] = fromDocs<WhatsAppTemplate>(await s.templates(order.businessId).where("purpose", "==", key).get()).filter(
+    (t) => t.status === "APPROVED",
+  );
   if (!template) {
     const detail = `The customer's 24-hour window is closed and there is no approved "${key.replace("order_", "")}" template.`;
     await notify(order.businessId, {
@@ -280,53 +279,52 @@ export async function changeOrderStatus(
   actor: AuditActor,
   opts: { note?: string; trackingNumber?: string; notifyCustomer?: boolean } = {},
 ) {
-  const order = await getOrderForBusiness(businessId, orderId);
-  if (order.status === to) throw new ApiError(400, `The order is already ${STATUS_LABEL[to].toLowerCase()}.`);
-  if (!STATUS_TRANSITIONS[order.status].includes(to)) {
-    throw new ApiError(400, `An order can't go from ${STATUS_LABEL[order.status]} to ${STATUS_LABEL[to]}.`);
-  }
-  const db = await getDb();
-  const updated = await db.transaction(async (tx) => {
-    const [row] = await tx
-      .update(orders)
-      .set({ status: to, ...(opts.trackingNumber !== undefined ? { trackingNumber: opts.trackingNumber.trim() } : {}) })
-      .where(and(eq(orders.id, orderId), eq(orders.status, order.status)))
-      .returning();
-    if (!row) throw new ApiError(409, "The order was updated by someone else. Refresh and try again.");
-    if (STOCK_RELEASING.includes(to) && !order.isTest) {
-      const items = await tx.select().from(orderItems).where(eq(orderItems.orderId, orderId));
-      await adjustStock(tx, items, 1);
+  const s = await store();
+  const ref = s.orders(businessId).doc(orderId);
+  const { before, updated } = await s.db.runTransaction(async (tx) => {
+    const order = fromDoc<Order>(await tx.get(ref));
+    if (!order) throw notFound("Order not found");
+    if (order.status === to) throw new ApiError(400, `The order is already ${STATUS_LABEL[to].toLowerCase()}.`);
+    if (!STATUS_TRANSITIONS[order.status].includes(to)) {
+      throw new ApiError(400, `An order can't go from ${STATUS_LABEL[order.status]} to ${STATUS_LABEL[to]}.`);
     }
-    await refreshCustomerStats(order.customerId, tx);
-    return row;
+    const stock = STOCK_RELEASING.includes(to) && !order.isTest ? await planStock(tx, businessId, order.items, 1) : null;
+    const next: Order = {
+      ...order,
+      status: to,
+      ...(opts.trackingNumber !== undefined ? { trackingNumber: opts.trackingNumber.trim() } : {}),
+      updatedAt: new Date(),
+    };
+    stock?.apply();
+    tx.update(ref, { status: next.status, trackingNumber: next.trackingNumber, updatedAt: next.updatedAt });
+    return { before: order, updated: next };
   });
+  await refreshCustomerStats(businessId, before.customerId);
 
-  const notification: NotifyResult =
-    opts.notifyCustomer === false ? { notification: "skipped" } : await notifyCustomer(updated, to);
-  await db.insert(orderStatusHistory).values({
-    businessId,
-    orderId,
-    fromStatus: order.status,
+  const notification: NotifyResult = opts.notifyCustomer === false ? { notification: "skipped" } : await notifyCustomer(updated, to);
+  const change: OrderStatusChange = {
+    id: newId(),
+    fromStatus: before.status,
     toStatus: to,
     changedByUserId: actor.userId ?? null,
     changedBy: actor.name,
     note: [opts.note?.trim(), notification.detail].filter(Boolean).join(" — "),
     notification: notification.notification,
+    createdAt: new Date(),
+  };
+  await s.db.runTransaction(async (tx) => {
+    const current = fromDoc<Order>(await tx.get(ref));
+    if (current) tx.update(ref, { history: [...current.history, change] });
   });
 
-  log.info("order.status_changed", { businessId, orderId, from: order.status, to, notification: notification.notification });
-  await audit(businessId, actor, "order.status_changed", { type: "order", id: orderId }, { from: order.status, to, notification: notification.notification });
+  log.info("order.status_changed", { businessId, orderId, from: before.status, to, notification: notification.notification });
+  await audit(businessId, actor, "order.status_changed", { type: "order", id: orderId }, { from: before.status, to, notification: notification.notification });
   publish(businessId, { type: "order.updated", orderId, orderNumber: updated.orderNumber, status: to });
-  return { order: updated, notification };
+  return { order: { ...updated, history: [...updated.history, change] }, notification };
 }
 
 /** Latest orders for a customer — used by "Where is my order?" (spec §29). */
 export async function customerOrders(businessId: string, customerId: string, limit = 5) {
-  const db = await getDb();
-  return db
-    .select()
-    .from(orders)
-    .where(and(eq(orders.businessId, businessId), eq(orders.customerId, customerId)))
-    .orderBy(desc(orders.createdAt))
-    .limit(limit);
+  const s = await store();
+  return fromDocs<Order>(await s.orders(businessId).where("customerId", "==", customerId).orderBy("createdAt", "desc").limit(limit).get());
 }

@@ -1,16 +1,7 @@
 import "server-only";
-import { and, asc, eq, max } from "drizzle-orm";
 import { z } from "zod";
-import { getDb } from "@/db";
-import {
-  botKnowledge,
-  botSettings,
-  businesses,
-  faqs,
-  orderFormFields,
-  type AIProviderName,
-  type OrderFieldType,
-} from "@/db/schema";
+import { fromDoc, fromDocs, newId, store } from "@/db";
+import type { AIProviderName, BotSettings, Business, Faq, KnowledgeNote, OrderFieldType, OrderForm, OrderFormField } from "@/db/schema";
 import { AI_PROVIDERS, createProvider, resolveAIConfig } from "../ai/service";
 import { listOpenAICompatibleModels, OPENAI_COMPATIBLE_DEFAULTS } from "../ai/openai-compatible";
 import { AIProviderError } from "../ai/types";
@@ -19,7 +10,7 @@ import { DEFAULT_RULES, ensureBotSettings } from "../bot/settings";
 import { ensureOrderForm, getOrderFields, SYSTEM_FIELDS, SYSTEM_KEYS } from "../commerce/order-form";
 import { decryptSecret, encryptSecret, secretHint } from "../crypto";
 import { env } from "../env";
-import { ApiError, badRequest, cleanText, notFound } from "../http";
+import { ApiError, badRequest, cleanText, docId, notFound } from "../http";
 import { log } from "../logger";
 
 /* ------------------------------------------------------------------ */
@@ -116,19 +107,25 @@ export type BotSettingsView = ReturnType<typeof toView>;
 
 export const DEFAULT_RULE_IDS = DEFAULT_RULES.map((rule) => rule.id);
 
+async function businessDoc(businessId: string) {
+  const s = await store();
+  const business = fromDoc<Business>(await s.businesses.doc(businessId).get());
+  if (!business) throw notFound("Business not found");
+  return business;
+}
+
 export async function getBotSettingsView(businessId: string): Promise<BotSettingsView> {
-  const db = await getDb();
-  const row = await ensureBotSettings(businessId);
-  const [business] = await db.select({ description: businesses.description }).from(businesses).where(eq(businesses.id, businessId));
+  const s = await store();
+  const [row, business] = await Promise.all([ensureBotSettings(businessId), s.businesses.doc(businessId).get().then((snap) => fromDoc<Business>(snap))]);
   return toView(row, business?.description ?? "");
 }
 
 export async function updateBotSettings(businessId: string, input: BotSettingsPatch, actor: AuditActor): Promise<BotSettingsView> {
-  const db = await getDb();
+  const s = await store();
   const current = await ensureBotSettings(businessId);
   const { businessDescription, aiApiKey, removeAiKey, ...rest } = input;
 
-  const set: Partial<typeof botSettings.$inferInsert> = { ...rest };
+  const set: Partial<BotSettings> = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
   let keyChange: "set" | "removed" | null = null;
   if (aiApiKey) {
     set.aiApiKeyEnc = encryptSecret(aiApiKey);
@@ -142,12 +139,12 @@ export async function updateBotSettings(businessId: string, input: BotSettingsPa
   const finalBaseUrl = rest.aiBaseUrl !== undefined ? rest.aiBaseUrl : current.aiBaseUrl;
   if (provider === "custom" && !finalBaseUrl) throw badRequest("aiBaseUrl: Enter the API URL for your custom provider");
 
-  await db.transaction(async (tx) => {
-    if (Object.keys(set).length) await tx.update(botSettings).set(set).where(eq(botSettings.businessId, businessId));
-    if (businessDescription !== undefined) {
-      await tx.update(businesses).set({ description: businessDescription }).where(eq(businesses.id, businessId));
-    }
-  });
+  // settings/bot and the business description (businesses/{b}.description) change together.
+  const now = new Date();
+  const batch = s.db.batch();
+  if (Object.keys(set).length) batch.update(s.bot(businessId), { ...set, updatedAt: now });
+  if (businessDescription !== undefined) batch.update(s.businesses.doc(businessId), { description: businessDescription, updatedAt: now });
+  await batch.commit();
 
   // Field names only — never values, and never the key.
   const fields = Object.keys(input).filter((k) => k !== "aiApiKey" && k !== "removeAiKey");
@@ -224,128 +221,136 @@ export const NoteInput = z.object({
   enabled: z.boolean().default(true),
 });
 
+/** FAQs in display order; ties (older data) fall back to creation time. */
+const isDocId = (value: string) => docId.safeParse(value).success;
+
+const byFaqOrder = (a: Faq, b: Faq) => a.sortOrder - b.sortOrder || a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : 1);
+
 export async function listKnowledge(businessId: string) {
-  const db = await getDb();
+  const s = await store();
   const [faqRows, noteRows] = await Promise.all([
-    db
-      .select({ id: faqs.id, question: faqs.question, answer: faqs.answer, enabled: faqs.enabled, sortOrder: faqs.sortOrder, updatedAt: faqs.updatedAt })
-      .from(faqs)
-      .where(eq(faqs.businessId, businessId))
-      .orderBy(asc(faqs.sortOrder), asc(faqs.createdAt)),
-    db
-      .select({ id: botKnowledge.id, title: botKnowledge.title, content: botKnowledge.content, enabled: botKnowledge.enabled, updatedAt: botKnowledge.updatedAt })
-      .from(botKnowledge)
-      .where(and(eq(botKnowledge.businessId, businessId), eq(botKnowledge.kind, "note")))
-      .orderBy(asc(botKnowledge.createdAt)),
+    s.faqs(businessId).orderBy("sortOrder").get().then((snap) => fromDocs<Faq>(snap)),
+    // Single equality filter; sorted in memory so no composite index is needed.
+    s.knowledge(businessId).where("kind", "==", "note").get().then((snap) => fromDocs<KnowledgeNote>(snap)),
   ]);
-  return { faqs: faqRows, notes: noteRows };
+  return {
+    faqs: faqRows
+      .sort(byFaqOrder)
+      .map((f) => ({ id: f.id, question: f.question, answer: f.answer, enabled: f.enabled, sortOrder: f.sortOrder, updatedAt: f.updatedAt })),
+    notes: noteRows
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : 1))
+      .map((n) => ({ id: n.id, title: n.title, content: n.content, enabled: n.enabled, updatedAt: n.updatedAt })),
+  };
 }
 
-export async function createFaq(businessId: string, input: z.infer<typeof FaqInput>, actor: AuditActor) {
-  const db = await getDb();
-  const [{ top }] = await db.select({ top: max(faqs.sortOrder) }).from(faqs).where(eq(faqs.businessId, businessId));
-  const [row] = await db
-    .insert(faqs)
-    .values({ businessId, ...input, sortOrder: (top ?? -1) + 1 })
-    .returning();
-  await audit(businessId, actor, "faq.created", { type: "faq", id: row.id });
-  return row;
+export async function createFaq(businessId: string, input: z.infer<typeof FaqInput>, actor: AuditActor): Promise<Faq> {
+  const s = await store();
+  const [top] = fromDocs<Faq>(await s.faqs(businessId).orderBy("sortOrder", "desc").limit(1).get());
+  const now = new Date();
+  const faq: Faq = { id: newId(), ...input, sortOrder: (top?.sortOrder ?? -1) + 1, createdAt: now, updatedAt: now };
+  const { id, ...doc } = faq;
+  await s.faqs(businessId).doc(id).create(doc);
+  await audit(businessId, actor, "faq.created", { type: "faq", id });
+  return faq;
 }
 
-export async function updateFaq(businessId: string, id: string, input: Partial<z.infer<typeof FaqPatch>>, actor: AuditActor) {
-  const db = await getDb();
-  const { move, ...fields } = input;
-  const row = await db.transaction(async (tx) => {
-    const [existing] = await tx.select().from(faqs).where(and(eq(faqs.id, id), eq(faqs.businessId, businessId)));
+export async function updateFaq(businessId: string, id: string, input: Partial<z.infer<typeof FaqPatch>>, actor: AuditActor): Promise<Faq> {
+  if (!isDocId(id)) throw notFound("FAQ not found");
+  const s = await store();
+  const { move, ...rest } = input;
+  const fields = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined)) as Partial<z.infer<typeof FaqInput>>;
+  const ref = s.faqs(businessId).doc(id);
+  const row = await s.db.runTransaction(async (tx) => {
+    const existing = fromDoc<Faq>(await tx.get(ref));
     if (!existing) throw notFound("FAQ not found");
+    const now = new Date();
+    const patches = new Map<string, Partial<Faq>>();
+
     if (move) {
       // Renumber everything so ties from older rows can't block a move.
-      const ordered = await tx
-        .select({ id: faqs.id })
-        .from(faqs)
-        .where(eq(faqs.businessId, businessId))
-        .orderBy(asc(faqs.sortOrder), asc(faqs.createdAt));
-      const ids = ordered.map((r) => r.id);
-      const from = ids.indexOf(id);
+      const ordered = fromDocs<Faq>(await tx.get(s.faqs(businessId).orderBy("sortOrder"))).sort(byFaqOrder);
+      const from = ordered.findIndex((f) => f.id === id);
       const to = move === "up" ? from - 1 : from + 1;
-      if (to >= 0 && to < ids.length) {
-        [ids[from], ids[to]] = [ids[to], ids[from]];
-        for (const [index, faqId] of ids.entries()) {
-          await tx.update(faqs).set({ sortOrder: index }).where(and(eq(faqs.id, faqId), eq(faqs.businessId, businessId)));
-        }
+      if (from >= 0 && to >= 0 && to < ordered.length) {
+        [ordered[from], ordered[to]] = [ordered[to], ordered[from]];
+        ordered.forEach((faq, index) => {
+          if (faq.sortOrder !== index) patches.set(faq.id, { sortOrder: index });
+        });
       }
     }
-    if (!Object.keys(fields).length) {
-      const [fresh] = await tx.select().from(faqs).where(eq(faqs.id, id));
-      return fresh;
-    }
-    const [updated] = await tx
-      .update(faqs)
-      .set(fields)
-      .where(and(eq(faqs.id, id), eq(faqs.businessId, businessId)))
-      .returning();
-    return updated;
+    if (Object.keys(fields).length) patches.set(id, { ...patches.get(id), ...fields, updatedAt: now });
+
+    for (const [faqId, patch] of patches) tx.update(s.faqs(businessId).doc(faqId), patch);
+    return { ...existing, ...patches.get(id) };
   });
   await audit(businessId, actor, "faq.updated", { type: "faq", id }, { fields: Object.keys(input) });
   return row;
 }
 
 export async function deleteFaq(businessId: string, id: string, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db.delete(faqs).where(and(eq(faqs.id, id), eq(faqs.businessId, businessId))).returning({ id: faqs.id });
-  if (!row) throw notFound("FAQ not found");
+  if (!isDocId(id)) throw notFound("FAQ not found");
+  const s = await store();
+  const ref = s.faqs(businessId).doc(id);
+  await s.db.runTransaction(async (tx) => {
+    if (!(await tx.get(ref)).exists) throw notFound("FAQ not found");
+    tx.delete(ref);
+  });
   await audit(businessId, actor, "faq.deleted", { type: "faq", id });
 }
 
-export async function createNote(businessId: string, input: z.infer<typeof NoteInput>, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db
-    .insert(botKnowledge)
-    .values({ businessId, kind: "note", ...input })
-    .returning();
-  await audit(businessId, actor, "knowledge.created", { type: "bot_knowledge", id: row.id }, { title: row.title });
-  return row;
+export async function createNote(businessId: string, input: z.infer<typeof NoteInput>, actor: AuditActor): Promise<KnowledgeNote> {
+  const s = await store();
+  const now = new Date();
+  const note: KnowledgeNote = { id: newId(), kind: "note", ...input, createdAt: now, updatedAt: now };
+  const { id, ...doc } = note;
+  await s.knowledge(businessId).doc(id).create(doc);
+  await audit(businessId, actor, "knowledge.created", { type: "bot_knowledge", id }, { title: note.title });
+  return note;
 }
 
-export async function updateNote(businessId: string, id: string, input: Partial<z.infer<typeof NoteInput>>, actor: AuditActor) {
-  const db = await getDb();
-  const where = and(eq(botKnowledge.id, id), eq(botKnowledge.businessId, businessId), eq(botKnowledge.kind, "note"));
-  const [row] = Object.keys(input).length
-    ? await db.update(botKnowledge).set(input).where(where).returning()
-    : await db.select().from(botKnowledge).where(where);
-  if (!row) throw notFound("Note not found");
+export async function updateNote(businessId: string, id: string, input: Partial<z.infer<typeof NoteInput>>, actor: AuditActor): Promise<KnowledgeNote> {
+  if (!isDocId(id)) throw notFound("Note not found");
+  const s = await store();
+  const ref = s.knowledge(businessId).doc(id);
+  const fields = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)) as Partial<z.infer<typeof NoteInput>>;
+  const row = await s.db.runTransaction(async (tx) => {
+    const current = fromDoc<KnowledgeNote>(await tx.get(ref));
+    if (!current || current.kind !== "note") throw notFound("Note not found");
+    if (!Object.keys(fields).length) return current;
+    const patch = { ...fields, updatedAt: new Date() };
+    tx.update(ref, patch);
+    return { ...current, ...patch };
+  });
   await audit(businessId, actor, "knowledge.updated", { type: "bot_knowledge", id }, { fields: Object.keys(input) });
   return row;
 }
 
 export async function deleteNote(businessId: string, id: string, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db
-    .delete(botKnowledge)
-    .where(and(eq(botKnowledge.id, id), eq(botKnowledge.businessId, businessId), eq(botKnowledge.kind, "note")))
-    .returning({ id: botKnowledge.id, title: botKnowledge.title });
-  if (!row) throw notFound("Note not found");
-  await audit(businessId, actor, "knowledge.deleted", { type: "bot_knowledge", id }, { title: row.title });
+  if (!isDocId(id)) throw notFound("Note not found");
+  const s = await store();
+  const ref = s.knowledge(businessId).doc(id);
+  const title = await s.db.runTransaction(async (tx) => {
+    const current = fromDoc<KnowledgeNote>(await tx.get(ref));
+    if (!current || current.kind !== "note") throw notFound("Note not found");
+    tx.delete(ref);
+    return current.title;
+  });
+  await audit(businessId, actor, "knowledge.deleted", { type: "bot_knowledge", id }, { title });
 }
 
 /** The business profile facts the assistant already knows (edited in Settings). */
 export async function getBusinessFacts(businessId: string) {
-  const db = await getDb();
-  const [row] = await db
-    .select({
-      description: businesses.description,
-      openingHours: businesses.openingHours,
-      deliveryInfo: businesses.deliveryInfo,
-      deliveryFee: businesses.deliveryFee,
-      paymentMethods: businesses.paymentMethods,
-      returnPolicy: businesses.returnPolicy,
-      exchangePolicy: businesses.exchangePolicy,
-      currency: businesses.currency,
-    })
-    .from(businesses)
-    .where(eq(businesses.id, businessId));
-  if (!row) throw notFound("Business not found");
-  return row;
+  const row = await businessDoc(businessId);
+  return {
+    description: row.description,
+    openingHours: row.openingHours,
+    deliveryInfo: row.deliveryInfo,
+    deliveryFee: row.deliveryFee,
+    paymentMethods: row.paymentMethods,
+    returnPolicy: row.returnPolicy,
+    exchangePolicy: row.exchangePolicy,
+    currency: row.currency,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -357,7 +362,7 @@ const KEY_PATTERN = /^[a-z][a-z0-9_]{0,39}$/;
 const MAX_FIELDS = 40;
 
 const OrderFieldInput = z.object({
-  id: z.uuid().optional(),
+  id: docId.optional(),
   key: z.string().trim().regex(KEY_PATTERN, "Keys use lowercase letters, numbers and _ (start with a letter, max 40)"),
   label: cleanText(80).pipe(z.string().min(1, "Every field needs a label")),
   type: z.enum(FIELD_TYPES),
@@ -388,15 +393,15 @@ function serializeField(row: Awaited<ReturnType<typeof getOrderFields>>[number])
 export type OrderFieldView = ReturnType<typeof serializeField>;
 
 export async function getOrderFormView(businessId: string) {
-  const db = await getDb();
-  const [fields, [business]] = await Promise.all([
+  const s = await store();
+  const [fields, business] = await Promise.all([
     getOrderFields(businessId, { includeDisabled: true }),
-    db.select({ paymentMethods: businesses.paymentMethods }).from(businesses).where(eq(businesses.id, businessId)),
+    s.businesses.doc(businessId).get().then((snap) => fromDoc<Business>(snap)),
   ]);
   return { fields: fields.map(serializeField), paymentMethods: business?.paymentMethods ?? [] };
 }
 
-/** Replaces the whole field list (order = array order) in one transaction. */
+/** Replaces the whole field list (order = array order) of settings/orderForm in one transaction. */
 export async function replaceOrderForm(businessId: string, input: z.infer<typeof OrderFormInput>, actor: AuditActor) {
   const seen = new Set<string>();
   for (const field of input.fields) {
@@ -415,41 +420,38 @@ export async function replaceOrderForm(businessId: string, input: z.infer<typeof
     }
   }
 
-  const db = await getDb();
-  await db.transaction(async (tx) => {
-    const form = await ensureOrderForm(businessId, tx);
-    const existing = await tx
-      .select({ id: orderFormFields.id, key: orderFormFields.key, system: orderFormFields.system })
-      .from(orderFormFields)
-      .where(eq(orderFormFields.businessId, businessId));
-    const byId = new Map(existing.map((row) => [row.id, row]));
+  const s = await store();
+  await ensureOrderForm(businessId);
+  const ref = s.orderForm(businessId);
+  await s.db.runTransaction(async (tx) => {
+    const form = fromDoc<OrderForm & { id: string }>(await tx.get(ref));
+    const byId = new Map((form?.fields ?? []).map((field) => [field.id, field]));
     for (const field of input.fields) {
       const previous = field.id ? byId.get(field.id) : undefined;
       if (previous?.system && previous.key !== field.key) throw badRequest("Built-in field keys can't be changed.");
     }
 
-    await tx.delete(orderFormFields).where(eq(orderFormFields.businessId, businessId));
-    await tx.insert(orderFormFields).values(
-      input.fields.map((field, index) => {
-        const system = SYSTEM_KEYS.has(field.key);
-        const phone = field.key === "phone";
-        return {
-          id: field.id && byId.has(field.id) ? field.id : undefined,
-          businessId,
-          formId: form.id,
-          key: field.key,
-          label: field.label,
-          type: field.type,
-          // The phone number always comes from WhatsApp, so it is always "collected".
-          required: phone ? true : field.required,
-          enabled: phone ? true : field.enabled,
-          system,
-          options: field.type === "select" && field.key !== "payment_method" ? [...new Set(field.options.filter(Boolean))] : [],
-          helpText: field.helpText,
-          sortOrder: index,
-        };
-      }),
-    );
+    const used = new Set<string>();
+    const fields: OrderFormField[] = input.fields.map((field, index) => {
+      const keepId = field.id && byId.has(field.id) && !used.has(field.id) ? field.id : null;
+      const id = keepId ?? newId();
+      used.add(id);
+      const phone = field.key === "phone";
+      return {
+        id,
+        key: field.key,
+        label: field.label,
+        type: field.type,
+        // The phone number always comes from WhatsApp, so it is always "collected".
+        required: phone ? true : field.required,
+        enabled: phone ? true : field.enabled,
+        system: SYSTEM_KEYS.has(field.key),
+        options: field.type === "select" && field.key !== "payment_method" ? [...new Set(field.options.filter(Boolean))] : [],
+        helpText: field.helpText,
+        sortOrder: index,
+      };
+    });
+    tx.set(ref, { name: form?.name ?? "Order information", fields, updatedAt: new Date() });
   });
 
   await audit(businessId, actor, "order_form.updated", { type: "order_form" }, { keys: input.fields.map((f) => f.key) });

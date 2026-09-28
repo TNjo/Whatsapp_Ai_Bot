@@ -1,25 +1,24 @@
 import "server-only";
-import { and, asc, count, eq } from "drizzle-orm";
 import { z } from "zod";
-import { getDb } from "@/db";
-import { botSettings, messages, orders, whatsappTemplates, type StatusMessageKey } from "@/db/schema";
+import { fromDoc, fromDocs, store } from "@/db";
+import type { StatusMessageKey, WhatsAppTemplate } from "@/db/schema";
 import { audit, type AuditActor } from "../audit";
 import { ensureBotSettings } from "../bot/settings";
 import { DEFAULT_STATUS_MESSAGES, STATUS_MESSAGE_LABELS } from "../commerce/status-messages";
 import { cleanText, notFound } from "../http";
-import { connectionView, TEMPLATE_VARIABLES } from "../whatsapp/connection";
+import { connectionView, TEMPLATE_VARIABLES, templateId } from "../whatsapp/connection";
 
 export async function whatsappOverview(businessId: string) {
-  const db = await getDb();
-  const [view, [msgCount], [orderCount], settings] = await Promise.all([
+  const s = await store();
+  const [view, msgCount, orderCount, settings] = await Promise.all([
     connectionView(businessId),
-    db.select({ n: count() }).from(messages).where(eq(messages.businessId, businessId)),
-    db.select({ n: count() }).from(orders).where(and(eq(orders.businessId, businessId), eq(orders.isTest, false))),
+    s.db.collectionGroup("messages").where("businessId", "==", businessId).count().get(),
+    s.orders(businessId).where("isTest", "==", false).count().get(),
     ensureBotSettings(businessId),
   ]);
   return {
     ...view,
-    stats: { messages: msgCount?.n ?? 0, orders: orderCount?.n ?? 0 },
+    stats: { messages: msgCount.data().count, orders: orderCount.data().count },
     bot: { aiEnabled: settings.aiEnabled, humanHandoffEnabled: settings.humanHandoffEnabled, botName: settings.botName },
   };
 }
@@ -48,41 +47,45 @@ export const TemplateInput = z.object({
 });
 
 export async function listTemplates(businessId: string) {
-  const db = await getDb();
-  return db.select().from(whatsappTemplates).where(eq(whatsappTemplates.businessId, businessId)).orderBy(asc(whatsappTemplates.name));
+  const s = await store();
+  return fromDocs<WhatsAppTemplate>(await s.templates(businessId).get()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Upserts by Meta template name + language. */
 export async function saveTemplate(businessId: string, input: z.infer<typeof TemplateInput>, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db
-    .insert(whatsappTemplates)
-    .values({ businessId, ...input })
-    .onConflictDoUpdate({
-      target: [whatsappTemplates.businessId, whatsappTemplates.name, whatsappTemplates.language],
-      set: { purpose: input.purpose, body: input.body, variables: input.variables, category: input.category, status: input.status },
-    })
-    .returning();
-  await audit(businessId, actor, "template.saved", { type: "whatsapp_template", id: row.id }, { name: row.name, purpose: row.purpose });
+  const s = await store();
+  const id = templateId(input.name, input.language);
+  const ref = s.templates(businessId).doc(id);
+  const existing = fromDoc<WhatsAppTemplate>(await ref.get());
+  const now = new Date();
+  const row: WhatsAppTemplate = existing
+    ? { ...existing, purpose: input.purpose, body: input.body, variables: input.variables, category: input.category, status: input.status, updatedAt: now }
+    : { id, ...input, metaTemplateId: null, createdAt: now, updatedAt: now };
+  const { id: _id, ...doc } = row;
+  void _id;
+  await ref.set(doc);
+  await audit(businessId, actor, "template.saved", { type: "whatsapp_template", id }, { name: row.name, purpose: row.purpose });
   return row;
 }
 
 export async function updateTemplate(businessId: string, id: string, input: Partial<z.infer<typeof TemplateInput>>, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db
-    .update(whatsappTemplates)
-    .set(input)
-    .where(and(eq(whatsappTemplates.id, id), eq(whatsappTemplates.businessId, businessId)))
-    .returning();
-  if (!row) throw notFound("Template not found");
+  const s = await store();
+  const ref = s.templates(businessId).doc(id);
+  const current = fromDoc<WhatsAppTemplate>(await ref.get());
+  if (!current) throw notFound("Template not found");
+  const patch = { ...input, updatedAt: new Date() };
+  await ref.update(patch);
   await audit(businessId, actor, "template.updated", { type: "whatsapp_template", id }, { fields: Object.keys(input) });
-  return row;
+  return { ...current, ...patch };
 }
 
 export async function deleteTemplate(businessId: string, id: string, actor: AuditActor) {
-  const db = await getDb();
-  const [row] = await db.delete(whatsappTemplates).where(and(eq(whatsappTemplates.id, id), eq(whatsappTemplates.businessId, businessId))).returning();
-  if (!row) throw notFound("Template not found");
-  await audit(businessId, actor, "template.deleted", { type: "whatsapp_template", id }, { name: row.name });
+  const s = await store();
+  const ref = s.templates(businessId).doc(id);
+  const current = fromDoc<WhatsAppTemplate>(await ref.get());
+  if (!current) throw notFound("Template not found");
+  await ref.delete();
+  await audit(businessId, actor, "template.deleted", { type: "whatsapp_template", id }, { name: current.name });
 }
 
 export async function statusMessagesView(businessId: string) {
@@ -97,7 +100,7 @@ export async function statusMessagesView(businessId: string) {
 }
 
 export async function saveStatusMessages(businessId: string, values: Partial<Record<StatusMessageKey, string>>, actor: AuditActor) {
-  const db = await getDb();
+  const s = await store();
   const settings = await ensureBotSettings(businessId);
   const next = { ...settings.statusMessages };
   for (const [key, text] of Object.entries(values) as [StatusMessageKey, string][]) {
@@ -105,7 +108,7 @@ export async function saveStatusMessages(businessId: string, values: Partial<Rec
     if (!clean || clean === DEFAULT_STATUS_MESSAGES[key]) delete next[key];
     else next[key] = clean.slice(0, 1000);
   }
-  await db.update(botSettings).set({ statusMessages: next }).where(eq(botSettings.businessId, businessId));
+  await s.bot(businessId).update({ statusMessages: next, updatedAt: new Date() });
   await audit(businessId, actor, "status_messages.updated", { type: "bot_settings" }, { keys: Object.keys(values) });
   return statusMessagesView(businessId);
 }

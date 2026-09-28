@@ -1,9 +1,8 @@
 import "server-only";
 import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { and, eq, gt, lt } from "drizzle-orm";
-import { getDb } from "@/db";
-import { businessMembers, businesses, sessions, users, type MemberRole } from "@/db/schema";
+import { fromDoc, store } from "@/db";
+import type { Business, Membership, MemberRole, Session, User } from "@/db/schema";
 import { randomToken, sha256 } from "./crypto";
 import { env } from "./env";
 import { ApiError } from "./http";
@@ -20,12 +19,14 @@ export type AuthContext = {
   actor: AuditActor;
 };
 
+export const membershipId = (businessId: string, userId: string) => `${businessId}_${userId}`;
+
 export async function createSession(userId: string, businessId: string) {
-  const db = await getDb();
+  const s = await store();
   const token = randomToken();
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400 * 1000);
   const userAgent = (await headers()).get("user-agent")?.slice(0, 200) ?? null;
-  await db.insert(sessions).values({ id: sha256(token), userId, businessId, expiresAt, userAgent });
+  await s.sessions.doc(sha256(token)).set({ userId, businessId, expiresAt, userAgent, createdAt: new Date() });
   (await cookies()).set(SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "lax",
@@ -33,17 +34,22 @@ export async function createSession(userId: string, businessId: string) {
     path: "/",
     expires: expiresAt,
   });
-  if (Math.random() < 0.05) await db.delete(sessions).where(lt(sessions.expiresAt, new Date()));
+  if (Math.random() < 0.05) {
+    const expired = await s.sessions.where("expiresAt", "<", new Date()).limit(200).get();
+    const batch = s.db.batch();
+    expired.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+  }
 }
 
 export async function destroySession() {
-  const store = await cookies();
-  const token = store.get(SESSION_COOKIE)?.value;
+  const jar = await cookies();
+  const token = jar.get(SESSION_COOKIE)?.value;
   if (token) {
-    const db = await getDb();
-    await db.delete(sessions).where(eq(sessions.id, sha256(token)));
+    const s = await store();
+    await s.sessions.doc(sha256(token)).delete();
   }
-  store.delete(SESSION_COOKIE);
+  jar.delete(SESSION_COOKIE);
 }
 
 /**
@@ -53,36 +59,25 @@ export async function destroySession() {
 export async function getAuth(): Promise<AuthContext | null> {
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return null;
-  const db = await getDb();
-  const [row] = await db
-    .select({
-      sessionId: sessions.id,
-      userId: users.id,
-      userName: users.name,
-      email: users.email,
-      businessId: businesses.id,
-      businessName: businesses.name,
-      currency: businesses.currency,
-      timezone: businesses.timezone,
-      role: businessMembers.role,
-    })
-    .from(sessions)
-    .innerJoin(users, eq(users.id, sessions.userId))
-    .innerJoin(businesses, eq(businesses.id, sessions.businessId))
-    .innerJoin(
-      businessMembers,
-      and(eq(businessMembers.businessId, sessions.businessId), eq(businessMembers.userId, sessions.userId)),
-    )
-    .where(and(eq(sessions.id, sha256(token)), gt(sessions.expiresAt, new Date())))
-    .limit(1);
-  if (!row) return null;
+  const s = await store();
+  const session = fromDoc<Session>(await s.sessions.doc(sha256(token)).get());
+  if (!session || session.expiresAt.getTime() <= Date.now()) return null;
+  const [userSnap, businessSnap, memberSnap] = await s.db.getAll(
+    s.users.doc(session.userId),
+    s.businesses.doc(session.businessId),
+    s.memberships.doc(membershipId(session.businessId, session.userId)),
+  );
+  const user = fromDoc<User>(userSnap);
+  const business = fromDoc<Business>(businessSnap);
+  const membership = fromDoc<Membership>(memberSnap);
+  if (!user || !business || !membership) return null;
   const ip = (await headers()).get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
   return {
-    sessionId: row.sessionId,
-    user: { id: row.userId, name: row.userName, email: row.email },
-    business: { id: row.businessId, name: row.businessName, currency: row.currency, timezone: row.timezone },
-    role: row.role,
-    actor: { userId: row.userId, name: row.userName, ip },
+    sessionId: session.id,
+    user: { id: user.id, name: user.name, email: user.email },
+    business: { id: business.id, name: business.name, currency: business.currency, timezone: business.timezone },
+    role: membership.role,
+    actor: { userId: user.id, name: user.name, ip },
   };
 }
 

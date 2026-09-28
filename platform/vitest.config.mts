@@ -15,7 +15,7 @@ export default defineConfig({
     hookTimeout: 60_000,
     fileParallelism: false,
     env: {
-      PGLITE_DIR: "memory://",
+      FIREBASE_USE_MEMORY: "true",
       AI_PROVIDER: "mock",
       META_APP_ID: "1234567890",
       META_APP_SECRET: "test-app-secret",

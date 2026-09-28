@@ -2,7 +2,7 @@ import { z } from "zod";
 import { requireApiAuth } from "@/server/auth";
 import { conversationMessages, sendManualReply } from "@/server/admin/inbox";
 import { loadConversation } from "@/server/conversations";
-import { cleanText, json, readJson, route } from "@/server/http";
+import { cleanText, docId, json, readJson, route } from "@/server/http";
 import { rateLimit } from "@/server/rate-limit";
 
 export const GET = route("conversations.messages", async (request, ctx: RouteContext<"/api/conversations/[id]/messages">) => {
@@ -17,7 +17,7 @@ export const GET = route("conversations.messages", async (request, ctx: RouteCon
 const Body = z
   .object({
     text: cleanText(4096).optional(),
-    templateId: z.string().uuid().optional(),
+    templateId: docId.optional(),
     variables: z.array(cleanText(500)).max(20).optional(),
   })
   .refine((b) => Boolean(b.text) !== Boolean(b.templateId), "Send either a text or a template");

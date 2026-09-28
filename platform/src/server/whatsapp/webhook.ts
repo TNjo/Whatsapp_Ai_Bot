@@ -1,8 +1,7 @@
 import "server-only";
 import crypto from "node:crypto";
-import { eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { whatsappConnections, type MessagePayload, type MessageType } from "@/db/schema";
+import { store } from "@/db";
+import type { MessagePayload, MessageType } from "@/db/schema";
 import { handleIncoming } from "../bot/engine";
 import { env } from "../env";
 import { log } from "../logger";
@@ -129,7 +128,7 @@ async function applyStatus(businessId: string, status: WaStatus) {
  */
 export async function processWebhook(payload: WebhookPayload) {
   if (payload.object !== "whatsapp_business_account") return;
-  const db = await getDb();
+  const s = await store();
   for (const entry of payload.entry ?? []) {
     for (const change of entry.changes ?? []) {
       if (change.field !== "messages" || !change.value) continue;
@@ -142,10 +141,7 @@ export async function processWebhook(payload: WebhookPayload) {
         continue;
       }
       const { businessId } = owner;
-      await db
-        .update(whatsappConnections)
-        .set({ lastWebhookEventAt: new Date() })
-        .where(eq(whatsappConnections.id, owner.connectionId));
+      await s.whatsapp(businessId).update({ lastWebhookEventAt: new Date() }).catch(() => undefined);
 
       for (const status of value.statuses ?? []) {
         try {

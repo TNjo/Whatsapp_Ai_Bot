@@ -1,7 +1,6 @@
 import "server-only";
-import { and, desc, eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { messages } from "@/db/schema";
+import { fromDocs, store } from "@/db";
+import type { Message } from "@/db/schema";
 import { createProvider } from "../ai/service";
 import type { AIMessage } from "../ai/types";
 import { AIProviderError } from "../ai/types";
@@ -20,13 +19,8 @@ export type AgentResult =
 
 /** Rebuilds recent conversation turns from stored messages (the database is the memory). */
 async function history(rt: ToolRuntime): Promise<AIMessage[]> {
-  const db = await getDb();
-  const rows = await db
-    .select()
-    .from(messages)
-    .where(and(eq(messages.conversationId, rt.conversation.id), eq(messages.businessId, rt.businessId)))
-    .orderBy(desc(messages.createdAt))
-    .limit(HISTORY_LIMIT);
+  const s = await store();
+  const rows = fromDocs<Message>(await s.messages(rt.businessId, rt.conversation.id).orderBy("createdAt", "desc").limit(HISTORY_LIMIT).get());
   const out: AIMessage[] = [];
   for (const row of rows.reverse()) {
     if (row.direction === "inbound") {

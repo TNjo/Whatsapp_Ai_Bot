@@ -1,11 +1,10 @@
 import "server-only";
-import { and, asc, eq, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
-import { getDb, type Tx } from "@/db";
-import { businesses, categories, products, productVariants, type ProductOption } from "@/db/schema";
+import { fromDoc, fromDocs, newId, store } from "@/db";
+import type { Business, Product, ProductOption, ProductVariant } from "@/db/schema";
 import { audit, type AuditActor } from "../audit";
-import { badRequest, cleanText, notFound } from "../http";
-import { resolveCategory } from "./categories";
+import { badRequest, cleanText, docId, notFound } from "../http";
+import { listCategories, resolveCategory } from "./categories";
 
 /** Prices arrive in major units from forms ("2500") and are stored in minor units. */
 const money = z.coerce.number().min(0).max(100_000_000).transform((v) => Math.round(v * 100));
@@ -16,10 +15,11 @@ const stockCount = z.coerce.number().int("Stock must be a whole number").min(0, 
 const MAX_OPTIONS = 3;
 const MAX_VARIANTS = 250;
 const MAX_IMAGES = 10;
-const UPLOAD_URL = /^\/api\/uploads\/([0-9a-f-]{36})\/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export const isUuid = (value: string) => UUID.test(value);
+const UPLOAD_URL = /^\/api\/uploads\/([A-Za-z0-9_-]{8,64})\/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)$/;
+/** Firestore document ids (newId) — also rejects "/", "." and "..". */
+export const isDocId = (value: string) => docId.safeParse(value).success;
+/** @deprecated ids are Firestore document ids now; kept for existing imports. */
+export const isUuid = isDocId;
 
 const OptionInput = z.object({
   name: cleanText(40).pipe(z.string().min(1, "Option name is required")),
@@ -51,7 +51,7 @@ export const ProductInput = z.object({
 
 export const StockInput = z.object({
   stock: stockCount.optional(),
-  variants: z.array(z.object({ id: z.string().regex(UUID, "Invalid variant"), stock: stockCount })).max(MAX_VARIANTS).optional(),
+  variants: z.array(z.object({ id: docId, stock: stockCount })).max(MAX_VARIANTS).optional(),
 });
 
 export type ProductInputData = z.infer<typeof ProductInput>;
@@ -109,52 +109,48 @@ function checkDiscount(price: number, discountPrice: number | null) {
 }
 
 /**
- * Makes the variant rows match every combination of `options`. Existing rows are
- * kept (same id, so carts/orders keep their links) and updated from `input` when a
- * matching optionValues entry is sent; missing combinations are inserted; rows for
- * combinations that no longer exist are deleted. Returns the summed stock, or null
- * when the product has no options.
+ * Makes the embedded variants match every combination of `options`. Existing
+ * variants are kept (same id, so carts/orders keep their links) and updated from
+ * `input` when a matching optionValues entry is sent; missing combinations get a
+ * new id; variants for combinations that no longer exist are dropped. `total` is
+ * the summed stock, or null when the product has no options.
  */
-async function syncVariants(tx: Tx, businessId: string, productId: string, options: ProductOption[], input?: VariantInputData[]) {
-  const existing = await tx
-    .select()
-    .from(productVariants)
-    .where(and(eq(productVariants.productId, productId), eq(productVariants.businessId, businessId)));
-
-  if (!options.length) {
-    if (existing.length) await tx.delete(productVariants).where(inArray(productVariants.id, existing.map((v) => v.id)));
-    return null;
-  }
+function syncVariants(existing: ProductVariant[], options: ProductOption[], input?: VariantInputData[]) {
+  if (!options.length) return { variants: [] as ProductVariant[], total: null };
 
   const existingByKey = new Map(existing.map((v) => [variantKey(v.optionValues), v]));
   const inputByKey = new Map((input ?? []).map((v) => [variantKey(v.optionValues), v]));
-  const kept = new Set<string>();
+  const variants: ProductVariant[] = [];
   let total = 0;
 
   for (const combo of combinations(options)) {
     const key = variantKey(combo);
     const current = existingByKey.get(key);
     const sent = inputByKey.get(key);
-    const next = {
+    const variant: ProductVariant = {
+      id: current?.id ?? newId(),
+      optionValues: combo,
       price: sent ? (sent.price ?? null) : (current?.price ?? null),
       stock: sent ? sent.stock : (current?.stock ?? 0),
       sku: sent ? sent.sku : (current?.sku ?? ""),
       active: sent ? sent.active : (current?.active ?? true),
     };
-    total += next.stock;
-    if (current) {
-      kept.add(current.id);
-      const changed =
-        current.price !== next.price || current.stock !== next.stock || current.sku !== next.sku || current.active !== next.active;
-      if (changed) await tx.update(productVariants).set(next).where(eq(productVariants.id, current.id));
-    } else {
-      await tx.insert(productVariants).values({ businessId, productId, optionValues: combo, ...next });
-    }
+    total += variant.stock;
+    variants.push(variant);
   }
+  return { variants, total };
+}
 
-  const stale = existing.filter((v) => !kept.has(v.id)).map((v) => v.id);
-  if (stale.length) await tx.delete(productVariants).where(inArray(productVariants.id, stale));
-  return total;
+const variantView = (v: ProductVariant) => ({ id: v.id, optionValues: v.optionValues, price: v.price, stock: v.stock, sku: v.sku, active: v.active });
+
+function sortVariants<T extends { optionValues: Record<string, string> }>(options: ProductOption[], variants: T[]): T[] {
+  const order = new Map(combinations(options).map((combo, index) => [variantKey(combo), index]));
+  // Firestore re-orders map keys; present values in the owner's option order ("Black / L", not "L / Black").
+  const ordered = (values: Record<string, string>) =>
+    Object.fromEntries([...options.filter((o) => o.name in values).map((o) => o.name), ...Object.keys(values)].map((k) => [k, values[k]]));
+  return [...variants]
+    .sort((a, b) => (order.get(variantKey(a.optionValues)) ?? 1e9) - (order.get(variantKey(b.optionValues)) ?? 1e9))
+    .map((variant) => ({ ...variant, optionValues: ordered(variant.optionValues) }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -164,129 +160,71 @@ async function syncVariants(tx: Tx, businessId: string, productId: string, optio
 export type ProductStatusFilter = "all" | "active" | "disabled" | "out_of_stock" | "low_stock";
 
 export async function lowStockThreshold(businessId: string) {
-  const db = await getDb();
-  const [row] = await db.select({ threshold: businesses.lowStockThreshold }).from(businesses).where(eq(businesses.id, businessId));
-  return row?.threshold ?? 5;
+  const s = await store();
+  const business = fromDoc<Business>(await s.businesses.doc(businessId).get());
+  return business?.lowStockThreshold ?? 5;
 }
 
+/** Catalogs are small: load the business's products once, then filter and sort in memory. */
 export async function listProducts(businessId: string, { q = "", status = "all" }: { q?: string; status?: ProductStatusFilter } = {}) {
-  const db = await getDb();
-  const query = q.trim();
-  const statusFilter =
-    status === "active" || status === "disabled"
-      ? eq(products.status, status)
-      : status === "out_of_stock"
-        ? and(eq(products.trackStock, true), lte(products.stock, 0))
-        : status === "low_stock"
-          ? and(
-              eq(products.trackStock, true),
-              sql`${products.stock} > 0`,
-              sql`${products.stock} <= (select ${businesses.lowStockThreshold} from ${businesses} where ${businesses.id} = ${businessId})`,
-            )
-          : undefined;
-  const rows = await db
-    .select({
-      id: products.id,
-      name: products.name,
-      description: products.description,
-      price: products.price,
-      discountPrice: products.discountPrice,
-      sku: products.sku,
-      stock: products.stock,
-      trackStock: products.trackStock,
-      images: products.images,
-      options: products.options,
-      status: products.status,
-      category: categories.name,
-      updatedAt: products.updatedAt,
+  const s = await store();
+  const [rows, categoryList, threshold] = await Promise.all([
+    s.products(businessId).get().then((snap) => fromDocs<Product>(snap)),
+    listCategories(businessId, "product"),
+    status === "low_stock" ? lowStockThreshold(businessId) : Promise.resolve(0),
+  ]);
+  const categoryName = new Map(categoryList.map((c) => [c.id, c.name]));
+  const query = q.trim().toLowerCase();
+
+  return rows
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      price: row.price,
+      discountPrice: row.discountPrice,
+      sku: row.sku,
+      stock: row.stock,
+      trackStock: row.trackStock,
+      images: row.images,
+      options: row.options,
+      status: row.status,
+      category: row.categoryId ? (categoryName.get(row.categoryId) ?? null) : null,
+      updatedAt: row.updatedAt,
+      variants: sortVariants(row.options, (row.variants ?? []).map(variantView)),
+    }))
+    .filter((row) => {
+      if (query && ![row.name, row.description, row.sku, row.category ?? ""].some((text) => text.toLowerCase().includes(query))) return false;
+      switch (status) {
+        case "active":
+        case "disabled":
+          return row.status === status;
+        case "out_of_stock":
+          return row.trackStock && row.stock <= 0;
+        case "low_stock":
+          return row.trackStock && row.stock > 0 && row.stock <= threshold;
+        default:
+          return true;
+      }
     })
-    .from(products)
-    .leftJoin(categories, eq(categories.id, products.categoryId))
-    .where(
-      and(
-        eq(products.businessId, businessId),
-        query
-          ? or(
-              ilike(products.name, `%${query}%`),
-              ilike(products.description, `%${query}%`),
-              ilike(products.sku, `%${query}%`),
-              ilike(categories.name, `%${query}%`),
-            )
-          : undefined,
-        statusFilter,
-      ),
-    )
-    .orderBy(asc(products.name));
-
-  const variants = rows.length
-    ? await db
-        .select({
-          id: productVariants.id,
-          productId: productVariants.productId,
-          optionValues: productVariants.optionValues,
-          price: productVariants.price,
-          stock: productVariants.stock,
-          sku: productVariants.sku,
-          active: productVariants.active,
-        })
-        .from(productVariants)
-        .where(and(eq(productVariants.businessId, businessId), inArray(productVariants.productId, rows.map((r) => r.id))))
-    : [];
-
-  return rows.map((row) => {
-    const own = variants
-      .filter((v) => v.productId === row.id)
-      .map((v) => ({ id: v.id, optionValues: v.optionValues, price: v.price, stock: v.stock, sku: v.sku, active: v.active }));
-    return { ...row, variants: sortVariants(row.options, own) };
-  });
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) || (a.id < b.id ? -1 : 1));
 }
 
 export type ProductListRow = Awaited<ReturnType<typeof listProducts>>[number];
 
-function sortVariants<T extends { optionValues: Record<string, string> }>(options: ProductOption[], variants: T[]): T[] {
-  const order = new Map(combinations(options).map((combo, index) => [variantKey(combo), index]));
-  // jsonb re-orders object keys; present values in the owner's option order ("Black / L", not "L / Black").
-  const ordered = (values: Record<string, string>) =>
-    Object.fromEntries([...options.filter((o) => o.name in values).map((o) => o.name), ...Object.keys(values)].map((k) => [k, values[k]]));
-  return [...variants]
-    .sort((a, b) => (order.get(variantKey(a.optionValues)) ?? 1e9) - (order.get(variantKey(b.optionValues)) ?? 1e9))
-    .map((variant) => ({ ...variant, optionValues: ordered(variant.optionValues) }));
-}
-
-async function findProduct(businessId: string, id: string, tx?: Tx) {
-  if (!isUuid(id)) return null;
-  const db = tx ?? (await getDb());
-  const [row] = await db
-    .select()
-    .from(products)
-    .where(and(eq(products.id, id), eq(products.businessId, businessId)));
-  return row ?? null;
+async function findProduct(businessId: string, id: string) {
+  if (!isDocId(id)) return null;
+  const s = await store();
+  return fromDoc<Product>(await s.products(businessId).doc(id).get());
 }
 
 export async function getProductDetail(businessId: string, id: string) {
   const product = await findProduct(businessId, id);
   if (!product) return null;
-  const db = await getDb();
-  const [variants, category] = await Promise.all([
-    db
-      .select({
-        id: productVariants.id,
-        optionValues: productVariants.optionValues,
-        price: productVariants.price,
-        stock: productVariants.stock,
-        sku: productVariants.sku,
-        active: productVariants.active,
-      })
-      .from(productVariants)
-      .where(and(eq(productVariants.productId, product.id), eq(productVariants.businessId, businessId))),
-    product.categoryId
-      ? db
-          .select({ name: categories.name })
-          .from(categories)
-          .where(and(eq(categories.id, product.categoryId), eq(categories.businessId, businessId)))
-          .then((r) => r[0]?.name ?? null)
-      : Promise.resolve(null),
-  ]);
+  const s = await store();
+  const category = product.categoryId
+    ? ((await s.categories(businessId).doc(product.categoryId).get()).data() as { name?: string } | undefined)?.name ?? null
+    : null;
   return {
     id: product.id,
     name: product.name,
@@ -302,7 +240,7 @@ export async function getProductDetail(businessId: string, id: string) {
     createdAt: product.createdAt,
     updatedAt: product.updatedAt,
     category,
-    variants: sortVariants(product.options, variants),
+    variants: sortVariants(product.options, (product.variants ?? []).map(variantView)),
   };
 }
 
@@ -313,79 +251,84 @@ export type ProductDetail = NonNullable<Awaited<ReturnType<typeof getProductDeta
 /* ------------------------------------------------------------------ */
 
 export async function createProduct(businessId: string, input: ProductInputData, actor: AuditActor) {
-  const db = await getDb();
+  const s = await store();
   const discountPrice = input.discountPrice ?? null;
   checkDiscount(input.price, discountPrice);
   const images = checkImages(businessId, input.images);
   const options = normalizeOptions(input.options);
   const categoryId = await resolveCategory(businessId, "product", input.category);
+  const { variants, total } = syncVariants([], options, input.variants);
 
-  const id = await db.transaction(async (tx) => {
-    const [row] = await tx
-      .insert(products)
-      .values({
-        businessId,
-        categoryId,
-        name: input.name,
-        description: input.description,
-        price: input.price,
-        discountPrice,
-        sku: input.sku,
-        stock: input.stock,
-        trackStock: input.trackStock,
-        images,
-        options,
-        status: input.status,
-      })
-      .returning({ id: products.id });
-    const total = await syncVariants(tx, businessId, row.id, options, input.variants);
-    if (total !== null) await tx.update(products).set({ stock: total }).where(eq(products.id, row.id));
-    return row.id;
-  });
+  const id = newId();
+  const now = new Date();
+  const product: Omit<Product, "id"> = {
+    businessId,
+    categoryId,
+    name: input.name,
+    description: input.description,
+    price: input.price,
+    discountPrice,
+    sku: input.sku,
+    stock: total ?? input.stock,
+    trackStock: input.trackStock,
+    images,
+    options,
+    variants,
+    status: input.status,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await s.products(businessId).doc(id).create(product);
 
-  await audit(businessId, actor, "product.created", { type: "product", id }, { name: input.name, variants: options.length ? combinations(options).length : 0 });
+  await audit(businessId, actor, "product.created", { type: "product", id }, { name: input.name, variants: variants.length });
   return (await getProductDetail(businessId, id))!;
 }
 
 export async function updateProduct(businessId: string, id: string, input: Partial<ProductInputData>, actor: AuditActor) {
-  const current = await findProduct(businessId, id);
-  if (!current) throw notFound("Product not found");
+  if (!isDocId(id)) throw notFound("Product not found");
+  const s = await store();
+  const ref = s.products(businessId).doc(id);
 
-  const price = input.price ?? current.price;
-  const discountPrice = input.discountPrice !== undefined ? (input.discountPrice ?? null) : current.discountPrice;
-  checkDiscount(price, discountPrice);
+  // Validation and category creation happen before the transaction (it may only read, then write).
+  const images = input.images !== undefined ? checkImages(businessId, input.images) : undefined;
+  const newOptions = input.options !== undefined ? normalizeOptions(input.options) : undefined;
+  const categoryId = input.category !== undefined ? await resolveCategory(businessId, "product", input.category) : undefined;
 
-  const set: Partial<typeof products.$inferInsert> = { updatedAt: new Date() };
-  if (input.name !== undefined) set.name = input.name;
-  if (input.description !== undefined) set.description = input.description;
-  if (input.sku !== undefined) set.sku = input.sku;
-  if (input.status !== undefined) set.status = input.status;
-  if (input.trackStock !== undefined) set.trackStock = input.trackStock;
-  if (input.price !== undefined) set.price = input.price;
-  if (input.discountPrice !== undefined) set.discountPrice = discountPrice;
-  if (input.images !== undefined) set.images = checkImages(businessId, input.images);
-  if (input.category !== undefined) set.categoryId = await resolveCategory(businessId, "product", input.category);
+  await s.db.runTransaction(async (tx) => {
+    const current = fromDoc<Product>(await tx.get(ref));
+    if (!current) throw notFound("Product not found");
 
-  const options = input.options !== undefined ? normalizeOptions(input.options) : current.options;
-  if (input.options !== undefined) set.options = options;
-  const touchesVariants = input.options !== undefined || input.variants !== undefined;
-  if (input.stock !== undefined && !touchesVariants && current.options.length) {
-    throw badRequest("This product has variants — update each variant's stock instead.");
-  }
+    const price = input.price ?? current.price;
+    const discountPrice = input.discountPrice !== undefined ? (input.discountPrice ?? null) : current.discountPrice;
+    checkDiscount(price, discountPrice);
 
-  const db = await getDb();
-  await db.transaction(async (tx) => {
+    const set: Partial<Omit<Product, "id">> = { updatedAt: new Date() };
+    if (input.name !== undefined) set.name = input.name;
+    if (input.description !== undefined) set.description = input.description;
+    if (input.sku !== undefined) set.sku = input.sku;
+    if (input.status !== undefined) set.status = input.status;
+    if (input.trackStock !== undefined) set.trackStock = input.trackStock;
+    if (input.price !== undefined) set.price = input.price;
+    if (input.discountPrice !== undefined) set.discountPrice = discountPrice;
+    if (images !== undefined) set.images = images;
+    if (categoryId !== undefined) set.categoryId = categoryId;
+
+    const options = newOptions ?? current.options;
+    if (newOptions !== undefined) set.options = newOptions;
+    const touchesVariants = input.options !== undefined || input.variants !== undefined;
+    if (input.stock !== undefined && !touchesVariants && current.options.length) {
+      throw badRequest("This product has variants — update each variant's stock instead.");
+    }
+
     if (touchesVariants) {
-      const total = await syncVariants(tx, businessId, id, options, input.variants);
+      const { variants, total } = syncVariants(current.variants ?? [], options, input.variants);
+      set.variants = variants;
       if (total !== null) set.stock = total;
       else if (input.stock !== undefined) set.stock = input.stock;
     } else if (input.stock !== undefined) {
       set.stock = input.stock;
     }
-    await tx
-      .update(products)
-      .set(set)
-      .where(and(eq(products.id, id), eq(products.businessId, businessId)));
+    tx.update(ref, set);
   });
 
   await audit(businessId, actor, "product.updated", { type: "product", id }, { fields: Object.keys(input) });
@@ -393,52 +336,41 @@ export async function updateProduct(businessId: string, id: string, input: Parti
 }
 
 export async function setProductStock(businessId: string, id: string, input: z.infer<typeof StockInput>, actor: AuditActor) {
-  const current = await findProduct(businessId, id);
-  if (!current) throw notFound("Product not found");
-  const db = await getDb();
+  if (!isDocId(id)) throw notFound("Product not found");
+  const s = await store();
+  const ref = s.products(businessId).doc(id);
 
-  const [{ count }] = await db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(productVariants)
-    .where(and(eq(productVariants.productId, id), eq(productVariants.businessId, businessId)));
+  const from = await s.db.runTransaction(async (tx) => {
+    const current = fromDoc<Product>(await tx.get(ref));
+    if (!current) throw notFound("Product not found");
+    const existing = current.variants ?? [];
 
-  if (count > 0) {
-    if (!input.variants?.length) throw badRequest("This product has variants — send the stock for each variant.");
-    await db.transaction(async (tx) => {
-      for (const variant of input.variants!) {
-        await tx
-          .update(productVariants)
-          .set({ stock: variant.stock })
-          .where(and(eq(productVariants.id, variant.id), eq(productVariants.productId, id), eq(productVariants.businessId, businessId)));
-      }
-      await tx
-        .update(products)
-        .set({
-          stock: sql`(select coalesce(sum(${productVariants.stock}), 0)::int from ${productVariants} where ${productVariants.productId} = ${id})`,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(products.id, id), eq(products.businessId, businessId)));
-    });
-  } else {
-    if (input.stock === undefined) throw badRequest("stock: Enter the quantity in stock");
-    await db
-      .update(products)
-      .set({ stock: input.stock, updatedAt: new Date() })
-      .where(and(eq(products.id, id), eq(products.businessId, businessId)));
-  }
+    if (existing.length > 0) {
+      if (!input.variants?.length) throw badRequest("This product has variants — send the stock for each variant.");
+      const sent = new Map(input.variants.map((v) => [v.id, v.stock]));
+      const variants = existing.map((v) => (sent.has(v.id) ? { ...v, stock: sent.get(v.id)! } : v));
+      tx.update(ref, { variants, stock: variants.reduce((sum, v) => sum + v.stock, 0), updatedAt: new Date() });
+    } else {
+      if (input.stock === undefined) throw badRequest("stock: Enter the quantity in stock");
+      tx.update(ref, { stock: input.stock, updatedAt: new Date() });
+    }
+    return current.stock;
+  });
 
   const product = (await getProductDetail(businessId, id))!;
-  await audit(businessId, actor, "product.stock_updated", { type: "product", id }, { from: current.stock, to: product.stock });
+  await audit(businessId, actor, "product.stock_updated", { type: "product", id }, { from, to: product.stock });
   return product;
 }
 
 export async function deleteProduct(businessId: string, id: string, actor: AuditActor) {
-  if (!isUuid(id)) throw notFound("Product not found");
-  const db = await getDb();
-  const [row] = await db
-    .delete(products)
-    .where(and(eq(products.id, id), eq(products.businessId, businessId)))
-    .returning({ id: products.id, name: products.name });
-  if (!row) throw notFound("Product not found");
-  await audit(businessId, actor, "product.deleted", { type: "product", id }, { name: row.name });
+  if (!isDocId(id)) throw notFound("Product not found");
+  const s = await store();
+  const ref = s.products(businessId).doc(id);
+  const name = await s.db.runTransaction(async (tx) => {
+    const current = fromDoc<Product>(await tx.get(ref));
+    if (!current) throw notFound("Product not found");
+    tx.delete(ref);
+    return current.name;
+  });
+  await audit(businessId, actor, "product.deleted", { type: "product", id }, { name });
 }

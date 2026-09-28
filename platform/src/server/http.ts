@@ -90,6 +90,9 @@ export function pagination(url: URL, defaults = { limit: 25, max: 100 }) {
   return { page, limit, offset: (page - 1) * limit };
 }
 
+/** A Firestore document id as used by this app (random hex ids, WhatsApp ids, test ids). */
+export const docId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/, "Invalid id");
+
 /** Collapses whitespace, strips control characters and trims. */
 export const cleanText = (max: number) =>
   z

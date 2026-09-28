@@ -1,41 +1,27 @@
 import "server-only";
 import crypto from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { businesses, cartItems, carts, customers, type CartStage } from "@/db/schema";
+import { fromDoc, newId, store } from "@/db";
+import type { Business, Cart, CartItem, CartStage, Customer } from "@/db/schema";
 import { formatMoney, variantLabel } from "@/lib/format";
-import {
-  findVariant,
-  getProduct,
-  getService,
-  loadVariants,
-  matchOptionValue,
-  variantAvailable,
-  variantPrice,
-  type Product,
-  type Variant,
-} from "./catalog";
+import { findVariant, getProduct, getService, matchOptionValue, variantAvailable, variantPrice, type Product, type Variant } from "./catalog";
 import { getOrderFields, type FormField } from "./order-form";
 
-export type Cart = typeof carts.$inferSelect;
+export type { Cart };
 
 export class CartError extends Error {}
 
+/** businesses/{b}/carts/{conversationId} is the conversation's open draft order. */
 export async function getOpenCart(businessId: string, conversationId: string): Promise<Cart | null> {
-  const db = await getDb();
-  const [cart] = await db
-    .select()
-    .from(carts)
-    .where(and(eq(carts.businessId, businessId), eq(carts.conversationId, conversationId), eq(carts.status, "open")));
-  return cart ?? null;
+  const s = await store();
+  return fromDoc<Cart>(await s.carts(businessId).doc(conversationId).get());
 }
 
 /** Creates the draft order, prefilled with details we already know about the customer. */
 export async function getOrCreateCart(businessId: string, conversationId: string, customerId: string): Promise<Cart> {
   const existing = await getOpenCart(businessId, conversationId);
   if (existing) return existing;
-  const db = await getDb();
-  const [customer] = await db.select().from(customers).where(eq(customers.id, customerId));
+  const s = await store();
+  const customer = fromDoc<Customer>(await s.customers(businessId).doc(customerId).get());
   const fields: Record<string, string> = {};
   if (customer && !customer.isTest && customer.phone) fields.phone = customer.phone;
   // Details from a previous order are reused; the review step lets the customer correct them.
@@ -44,8 +30,28 @@ export async function getOrCreateCart(businessId: string, conversationId: string
     fields.address = customer.address;
     if (customer.city) fields.city = customer.city;
   }
-  const [cart] = await db.insert(carts).values({ businessId, conversationId, customerId, fields }).returning();
+  const now = new Date();
+  const cart: Cart = {
+    id: conversationId,
+    businessId,
+    conversationId,
+    customerId,
+    stage: "BROWSING",
+    items: [],
+    fields,
+    reviewHash: null,
+    reviewSentAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await s.carts(businessId).doc(conversationId).set({ ...cart, id: undefined });
   return cart;
+}
+
+async function saveCart(cart: Cart) {
+  const s = await store();
+  const { id, ...rest } = cart;
+  await s.carts(cart.businessId).doc(id).set({ ...rest, updatedAt: new Date() });
 }
 
 export type CartLine = {
@@ -84,19 +90,16 @@ function fieldOptions(field: FormField, paymentMethods: string[]) {
 }
 
 export async function viewCart(businessId: string, cart: Cart): Promise<CartView> {
-  const db = await getDb();
-  const [business] = await db.select().from(businesses).where(eq(businesses.id, businessId));
-  const rows = await db.select().from(cartItems).where(eq(cartItems.cartId, cart.id)).orderBy(asc(cartItems.createdAt));
-  const productIds = rows.map((row) => row.productId).filter((id): id is string => Boolean(id));
-  const variantMap = await loadVariants(productIds);
+  const s = await store();
+  const business = fromDoc<Business>(await s.businesses.doc(businessId).get())!;
+  const rows = [...cart.items].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
   const items: CartLine[] = [];
   for (const row of rows) {
     if (row.productId) {
       const found = await getProduct(businessId, row.productId);
       if (!found) continue;
-      const { product } = found;
-      const variants = variantMap.get(product.id) ?? [];
+      const { product, variants } = found;
       const missingOptions = product.options
         .filter((option) => !row.optionValues[option.name])
         .map((option) => ({ name: option.name, values: option.values }));
@@ -154,13 +157,7 @@ export async function viewCart(businessId: string, cart: Cart): Promise<CartView
   const paymentMethods = business.paymentMethods;
   const missingFields = fields
     .filter((field) => field.required && !cart.fields[field.key]?.trim())
-    .map((field) => ({
-      key: field.key,
-      label: field.label,
-      type: field.type,
-      options: fieldOptions(field, paymentMethods),
-      helpText: field.helpText,
-    }));
+    .map((field) => ({ key: field.key, label: field.label, type: field.type, options: fieldOptions(field, paymentMethods), helpText: field.helpText }));
   const optionalFields = fields.filter((field) => !field.required && !cart.fields[field.key]?.trim()).map((f) => ({ key: f.key, label: f.label }));
 
   const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0);
@@ -198,17 +195,18 @@ export async function viewCart(businessId: string, cart: Cart): Promise<CartView
   };
 }
 
-/** Persists the computed stage and drops a stale review whenever the cart changes. */
-async function touch(businessId: string, cartId: string) {
-  const db = await getDb();
-  const [cart] = await db.select().from(carts).where(eq(carts.id, cartId));
-  const view = await viewCart(businessId, cart);
-  const stale = cart.reviewSentAt && cart.reviewHash !== view.reviewHash;
-  await db
-    .update(carts)
-    .set({ stage: view.stage, ...(stale ? { reviewSentAt: null, reviewHash: null } : {}) })
-    .where(eq(carts.id, cartId));
-  return viewCart(businessId, { ...cart, stage: view.stage, ...(stale ? { reviewSentAt: null, reviewHash: null } : {}) });
+/** Saves the cart with its computed stage, dropping a stale review whenever the contents changed. */
+async function touch(cart: Cart) {
+  const view = await viewCart(cart.businessId, cart);
+  const stale = Boolean(cart.reviewSentAt && cart.reviewHash !== view.reviewHash);
+  const next: Cart = { ...cart, stage: view.stage, ...(stale ? { reviewSentAt: null, reviewHash: null } : {}) };
+  await saveCart(next);
+  return stale ? viewCart(next.businessId, next) : view;
+}
+
+/** Reloads the cart so consecutive tool steps always work on the latest state. */
+async function fresh(businessId: string, cart: Cart) {
+  return (await getOpenCart(businessId, cart.conversationId)) ?? cart;
 }
 
 function resolveOptions(product: Product, requested: Record<string, string> | undefined, current: Record<string, string> = {}) {
@@ -228,18 +226,30 @@ function resolveOptions(product: Product, requested: Record<string, string> | un
   return { chosen, errors };
 }
 
+const sameOptions = (a: Record<string, string>, b: Record<string, string>) =>
+  JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
+
 export async function addCartItem(
   businessId: string,
-  cart: Cart,
+  cartInput: Cart,
   input: { productId?: string; serviceId?: string; quantity?: number; options?: Record<string, string> },
 ) {
-  const db = await getDb();
+  const cart = await fresh(businessId, cartInput);
   const quantity = Math.max(1, Math.min(99, Math.floor(input.quantity ?? 1)));
+  const item = (patch: Partial<CartItem>): CartItem => ({
+    id: newId(),
+    productId: null,
+    variantId: null,
+    serviceId: null,
+    optionValues: {},
+    quantity,
+    createdAt: new Date(),
+    ...patch,
+  });
   if (input.serviceId) {
     const service = await getService(businessId, input.serviceId);
     if (!service || service.status !== "active") throw new CartError("That service is not available.");
-    await db.insert(cartItems).values({ businessId, cartId: cart.id, serviceId: service.id, quantity });
-    return { view: await touch(businessId, cart.id), warnings: [] as string[] };
+    return { view: await touch({ ...cart, items: [...cart.items, item({ serviceId: service.id })] }), warnings: [] as string[] };
   }
   if (!input.productId) throw new CartError("Provide a productId or serviceId from the catalog.");
   const found = await getProduct(businessId, input.productId);
@@ -247,58 +257,51 @@ export async function addCartItem(
   const { chosen, errors } = resolveOptions(found.product, input.options);
 
   // Merge with an identical line instead of duplicating it.
-  const existing = await db.select().from(cartItems).where(and(eq(cartItems.cartId, cart.id), eq(cartItems.productId, found.product.id)));
-  const same = existing.find((row) => JSON.stringify(Object.entries(row.optionValues).sort()) === JSON.stringify(Object.entries(chosen).sort()));
-  if (same) {
-    await db.update(cartItems).set({ quantity: Math.min(99, same.quantity + quantity) }).where(eq(cartItems.id, same.id));
-  } else {
-    await db.insert(cartItems).values({ businessId, cartId: cart.id, productId: found.product.id, optionValues: chosen, quantity });
-  }
-  return { view: await touch(businessId, cart.id), warnings: errors };
+  const same = cart.items.find((row) => row.productId === found.product.id && sameOptions(row.optionValues, chosen));
+  const items = same
+    ? cart.items.map((row) => (row === same ? { ...row, quantity: Math.min(99, row.quantity + quantity) } : row))
+    : [...cart.items, item({ productId: found.product.id, optionValues: chosen })];
+  return { view: await touch({ ...cart, items }), warnings: errors };
 }
 
 export async function updateCartItem(
   businessId: string,
-  cart: Cart,
+  cartInput: Cart,
   itemId: string,
   input: { quantity?: number; options?: Record<string, string> },
 ) {
-  const db = await getDb();
-  const [row] = await db.select().from(cartItems).where(and(eq(cartItems.id, itemId), eq(cartItems.cartId, cart.id)));
+  const cart = await fresh(businessId, cartInput);
+  const row = cart.items.find((i) => i.id === itemId);
   if (!row) throw new CartError("That item is not in the cart. Use an itemId from the cart.");
   const warnings: string[] = [];
-  const set: Partial<typeof cartItems.$inferInsert> = {};
-  if (input.quantity !== undefined) {
-    if (input.quantity <= 0) {
-      await db.delete(cartItems).where(eq(cartItems.id, row.id));
-      return { view: await touch(businessId, cart.id), warnings };
-    }
-    set.quantity = Math.min(99, Math.floor(input.quantity));
+  if (input.quantity !== undefined && input.quantity <= 0) {
+    return { view: await touch({ ...cart, items: cart.items.filter((i) => i.id !== itemId) }), warnings };
   }
+  const next: CartItem = { ...row };
+  if (input.quantity !== undefined) next.quantity = Math.min(99, Math.floor(input.quantity));
   if (input.options && row.productId) {
     const found = await getProduct(businessId, row.productId);
     if (found) {
       const { chosen, errors } = resolveOptions(found.product, input.options, row.optionValues);
-      set.optionValues = chosen;
+      next.optionValues = chosen;
       warnings.push(...errors);
     }
   }
-  if (Object.keys(set).length) await db.update(cartItems).set(set).where(eq(cartItems.id, row.id));
-  return { view: await touch(businessId, cart.id), warnings };
+  return { view: await touch({ ...cart, items: cart.items.map((i) => (i.id === itemId ? next : i)) }), warnings };
 }
 
-export async function removeCartItem(businessId: string, cart: Cart, itemId: string) {
-  const db = await getDb();
-  const deleted = await db.delete(cartItems).where(and(eq(cartItems.id, itemId), eq(cartItems.cartId, cart.id))).returning();
-  if (!deleted.length) throw new CartError("That item is not in the cart.");
-  return touch(businessId, cart.id);
+export async function removeCartItem(businessId: string, cartInput: Cart, itemId: string) {
+  const cart = await fresh(businessId, cartInput);
+  if (!cart.items.some((i) => i.id === itemId)) throw new CartError("That item is not in the cart.");
+  return touch({ ...cart, items: cart.items.filter((i) => i.id !== itemId) });
 }
 
 /** Validates and stores order-form answers. Unknown keys and invalid choices are reported back. */
-export async function setCartFields(businessId: string, cart: Cart, values: Record<string, unknown>) {
-  const db = await getDb();
+export async function setCartFields(businessId: string, cartInput: Cart, values: Record<string, unknown>) {
+  const cart = await fresh(businessId, cartInput);
+  const s = await store();
   const fields = await getOrderFields(businessId);
-  const [business] = await db.select().from(businesses).where(eq(businesses.id, businessId));
+  const business = fromDoc<Business>(await s.businesses.doc(businessId).get())!;
   const next = { ...cart.fields };
   const warnings: string[] = [];
   for (const [key, raw] of Object.entries(values)) {
@@ -307,7 +310,9 @@ export async function setCartFields(businessId: string, cart: Cart, values: Reco
       warnings.push(`"${key}" is not an order field. Valid keys: ${fields.map((f) => f.key).join(", ")}.`);
       continue;
     }
-    const value = String(raw ?? "").trim().slice(0, 500);
+    const value = String(raw ?? "")
+      .trim()
+      .slice(0, 500);
     if (!value) {
       delete next[key];
       continue;
@@ -337,21 +342,18 @@ export async function setCartFields(businessId: string, cart: Cart, values: Reco
       next[key] = value;
     }
   }
-  await db.update(carts).set({ fields: next }).where(eq(carts.id, cart.id));
-  return { view: await touch(businessId, cart.id), warnings };
+  return { view: await touch({ ...cart, fields: next }), warnings };
 }
 
-export async function markReviewSent(cartId: string, reviewHash: string) {
-  const db = await getDb();
-  await db
-    .update(carts)
-    .set({ reviewHash, reviewSentAt: new Date(), stage: "CUSTOMER_CONFIRMATION" })
-    .where(eq(carts.id, cartId));
+export async function markReviewSent(businessId: string, cartId: string, reviewHash: string) {
+  const s = await store();
+  await s.carts(businessId).doc(cartId).update({ reviewHash, reviewSentAt: new Date(), stage: "CUSTOMER_CONFIRMATION", updatedAt: new Date() });
 }
 
+/** The customer no longer wants the draft: remove it (orders keep their own copy of everything). */
 export async function abandonCart(businessId: string, cart: Cart) {
-  const db = await getDb();
-  await db.update(carts).set({ status: "abandoned" }).where(and(eq(carts.id, cart.id), eq(carts.businessId, businessId)));
+  const s = await store();
+  await s.carts(businessId).doc(cart.id).delete();
 }
 
 /** The review message (spec §22), built from computed data — never from AI text. */
